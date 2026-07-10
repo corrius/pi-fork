@@ -110,12 +110,7 @@ import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import {
-	getLatestCompactionBoundary,
-	getLatestCompactionEntry,
-	getProviderStateTarget,
-	isProviderStateCompatible,
-} from "./session-manager.ts";
+import { getLatestCompactionBoundary, getProviderStateTarget, isProviderStateCompatible } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -2265,7 +2260,7 @@ export class AgentSession {
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled || this.model?.compaction === "native") return false;
+		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
@@ -2282,7 +2277,10 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionBoundary(
+			this.sessionManager.getBranch(),
+			getProviderStateTarget(this.model),
+		);
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
@@ -2332,7 +2330,12 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			const overflowEntry = this.sessionManager.getLeafEntry();
+			const excludedEntryIds =
+				overflowEntry?.type === "message" && overflowEntry.message === assistantMessage
+					? [overflowEntry.id]
+					: undefined;
+			return await this._runAutoCompaction("overflow", willRetry, excludedEntryIds);
 		}
 
 		// Case 3: threshold compaction without retry.
@@ -2379,7 +2382,11 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		excludedEntryIds?: string[],
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 		let fromExtension = false;
@@ -2389,19 +2396,14 @@ export class AgentSession {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
-
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
+			const native = this.model.compaction === "native";
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) return false;
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
-
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -2412,7 +2414,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
-					mode: "summary",
+					mode: native ? "native" : "summary",
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
@@ -2437,6 +2439,30 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const result = await this._compactProviderContext(
+					reason,
+					willRetry,
+					this._autoCompactionAbortController.signal,
+					excludedEntryIds,
+				);
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				return willRetry || this.agent.hasQueuedMessages();
+			}
+
+			let requestModel = this.model;
+			let apiKey: string | undefined;
+			let headers: Record<string, string> | undefined;
+			let env: Record<string, string> | undefined;
+			if (this.agent.streamFunction === streamSimple) {
+				({ model: requestModel, apiKey, headers, env } = await this._getRequiredRequestAuth(this.model));
+			} else {
+				({ model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
 			}
 
 			let summary: string;
@@ -2490,8 +2516,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event

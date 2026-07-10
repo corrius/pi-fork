@@ -25,6 +25,7 @@ function createSession(options: {
 	compactionUsage?: AssistantUsage;
 	toolUsage?: AssistantUsage;
 	usingSubscription?: boolean;
+	compactionTypes?: Array<"compaction" | "provider_checkpoint">;
 }): AgentSession {
 	const usage = options.usage;
 	const entries: Array<Record<string, unknown>> = [];
@@ -63,6 +64,8 @@ function createSession(options: {
 		});
 	}
 
+	entries.push(...(options.compactionTypes ?? []).map((type) => ({ type })));
+
 	const session = {
 		state: {
 			model: {
@@ -75,6 +78,7 @@ function createSession(options: {
 		},
 		sessionManager: {
 			getEntries: () => entries,
+			getBranch: () => entries,
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
@@ -248,5 +252,16 @@ describe("FooterComponent width handling", () => {
 
 		expect(stats).toContain("$1.234");
 		expect(stats).not.toContain("(sub)");
+	});
+
+	it("shows the number of compactions on the active branch", () => {
+		const session = createSession({
+			sessionName: "",
+			compactionTypes: ["compaction", "provider_checkpoint"],
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		const statsLine = stripAnsi(footer.render(120)[1]);
+		expect(statsLine).toContain("↻2");
 	});
 });

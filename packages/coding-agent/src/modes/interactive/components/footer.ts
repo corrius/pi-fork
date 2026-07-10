@@ -98,7 +98,10 @@ export class FooterComponent implements Component {
 					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
 			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
 				addUsageToTotals(usageTotals, entry.message.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+			} else if (
+				(entry.type === "branch_summary" || entry.type === "compaction" || entry.type === "provider_checkpoint") &&
+				entry.usage
+			) {
 				addUsageToTotals(usageTotals, entry.usage);
 			}
 		}
@@ -125,6 +128,10 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} • ${sessionName}`;
 		}
 
+		const compactionCount = this.session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "compaction" || entry.type === "provider_checkpoint").length;
+
 		// Build stats line
 		const statsParts = [];
 		if (usageTotals.input) statsParts.push(`↑${formatTokens(usageTotals.input)}`);
@@ -134,6 +141,7 @@ export class FooterComponent implements Component {
 		if ((usageTotals.cacheRead > 0 || usageTotals.cacheWrite > 0) && latestCacheHitRate !== undefined) {
 			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
 		}
+		if (compactionCount > 0) statsParts.push(`↻${compactionCount}`);
 
 		// Kimi Coding is subscription-backed despite using API-key authentication.
 		const usingSubscription = state.model
