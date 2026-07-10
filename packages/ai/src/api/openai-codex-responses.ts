@@ -6,12 +6,14 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-import { clampThinkingLevel } from "../models.ts";
+import { calculateCost, clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
 	Api,
 	AssistantMessage,
 	Context,
+	ContextCompactionOptions,
+	ContextCompactionResult,
 	Model,
 	ProviderEnv,
 	ProviderHeaders,
@@ -78,6 +80,15 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 }
 
 type CodexResponseStatus = "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress";
+
+interface CompactResponse {
+	output: ResponseInput;
+	usage?: {
+		input_tokens?: number;
+		output_tokens?: number;
+		input_tokens_details?: { cached_tokens?: number };
+	};
+}
 
 interface RequestBody {
 	model: string;
@@ -512,6 +523,150 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 	} satisfies OpenAICodexResponsesOptions);
 };
 
+export async function compactContext(
+	model: Model<"openai-codex-responses">,
+	context: Context,
+	options?: ContextCompactionOptions,
+): Promise<ContextCompactionResult<ResponseInput>> {
+	const apiKey = options?.apiKey;
+	if (!apiKey) {
+		throw new Error(`No API key for provider: ${model.provider}`);
+	}
+
+	const accountId = extractAccountId(apiKey);
+	const base = buildBaseOptions(model, context, options, apiKey);
+	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	const requestOptions: OpenAICodexResponsesOptions = {
+		...base,
+		reasoningEffort: clampedReasoning === "off" ? undefined : clampedReasoning,
+	};
+	const cacheSessionId = requestOptions.cacheRetention === "none" ? undefined : requestOptions.sessionId;
+	const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
+	const request = buildRequestBody(model, context, requestOptions, codexSessionId);
+	let body: RequestBody = {
+		model: request.model,
+		input: request.input,
+		instructions: request.instructions,
+		tools: request.tools,
+		parallel_tool_calls: request.parallel_tool_calls,
+		reasoning: request.reasoning,
+		service_tier: request.service_tier,
+		prompt_cache_key: request.prompt_cache_key,
+		text: request.text,
+	};
+	const nextBody = await options?.onPayload?.(body, model);
+	if (nextBody !== undefined) body = nextBody as RequestBody;
+
+	const headers = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
+	headers.set("accept", "application/json");
+	let compacted: CompactResponse;
+	try {
+		compacted = await postCodexCompactRequest(model, body, headers, options);
+	} catch (error) {
+		if (options?.signal?.aborted) throw new DOMException("Request was aborted", "AbortError");
+		throw error;
+	}
+	if (!Array.isArray(compacted.output)) {
+		throw new Error("Invalid Codex compact response: output must be an array");
+	}
+
+	return {
+		state: {
+			provider: model.provider,
+			api: model.api,
+			model: model.id,
+			baseUrl: normalizeCodexBaseUrl(model.baseUrl),
+			data: compacted.output,
+		},
+		usage: compacted.usage ? buildCompactionUsage(model, compacted.usage, requestOptions.serviceTier) : undefined,
+	};
+}
+
+async function postCodexCompactRequest(
+	model: Model<"openai-codex-responses">,
+	body: RequestBody,
+	headers: Headers,
+	options?: ContextCompactionOptions,
+): Promise<CompactResponse> {
+	const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
+	const timeoutMs = normalizeTimeoutMs(options?.timeoutMs);
+
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		if (options?.signal?.aborted) throw new Error("Request was aborted");
+		const timeoutSignal = timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined;
+		const combinedSignal = combineAbortSignals([options?.signal, timeoutSignal]);
+		let retryDelayMs: number | undefined;
+		try {
+			let response: Response;
+			try {
+				response = await fetch(resolveCodexCompactUrl(model.baseUrl), {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+					signal: combinedSignal.signal,
+				});
+			} catch (error) {
+				if (options?.signal?.aborted) throw new Error("Request was aborted");
+				const requestError =
+					timeoutSignal?.aborted && timeoutMs !== undefined
+						? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+						: error;
+				if (attempt >= maxRetries) throw requestError;
+				retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+				continue;
+			}
+
+			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			if (response.ok) {
+				try {
+					return (await response.json()) as CompactResponse;
+				} catch (error) {
+					if (options?.signal?.aborted) throw new Error("Request was aborted");
+					const responseError =
+						timeoutSignal?.aborted && timeoutMs !== undefined
+							? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+							: error;
+					if (attempt >= maxRetries) throw responseError;
+					retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+					continue;
+				}
+			}
+
+			let errorText: string;
+			try {
+				errorText = await response.text();
+			} catch (error) {
+				if (options?.signal?.aborted) throw new Error("Request was aborted");
+				const responseError =
+					timeoutSignal?.aborted && timeoutMs !== undefined
+						? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+						: error;
+				if (attempt >= maxRetries) throw responseError;
+				retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+				continue;
+			}
+			if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+				const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
+				retryDelayMs =
+					retryAfterDelayMs === undefined
+						? BASE_DELAY_MS * 2 ** attempt
+						: validateRetryDelayMs(retryAfterDelayMs, options);
+				continue;
+			}
+
+			const info = await parseErrorResponse(
+				new Response(errorText, { status: response.status, statusText: response.statusText }),
+			);
+			throw new Error(info.friendlyMessage || info.message);
+		} finally {
+			combinedSignal.cleanup();
+			if (retryDelayMs !== undefined) await sleep(retryDelayMs, options?.signal);
+		}
+	}
+
+	throw new Error("Codex compact request failed after retries");
+}
+
 // ============================================================================
 // Request Building
 // ============================================================================
@@ -534,7 +689,7 @@ function buildRequestBody(
 			? "tool-search"
 			: undefined;
 	const toolPlacement = splitDeferredTools(context, deferredToolsMode !== undefined);
-	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
+	const convertedMessages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
 		grammarToolInputProperties,
 		deferredTools: toolPlacement.deferred,
@@ -545,6 +700,7 @@ function buildRequestBody(
 			supportsOpenAIGrammarTools,
 		},
 	});
+	const messages = [...getCompactedInput(model, context), ...convertedMessages] as ResponseInput;
 
 	const body: RequestBody = {
 		model: model.id,
@@ -630,12 +786,56 @@ function resolveCodexServiceTier(
 	return responseServiceTier ?? requestServiceTier;
 }
 
-function resolveCodexUrl(baseUrl?: string): string {
+function normalizeCodexBaseUrl(baseUrl?: string): string {
 	const raw = baseUrl && baseUrl.trim().length > 0 ? baseUrl : DEFAULT_CODEX_BASE_URL;
-	const normalized = raw.replace(/\/+$/, "");
+	return raw.replace(/\/+$/, "");
+}
+
+function resolveCodexUrl(baseUrl?: string): string {
+	const normalized = normalizeCodexBaseUrl(baseUrl);
 	if (normalized.endsWith("/codex/responses")) return normalized;
 	if (normalized.endsWith("/codex")) return `${normalized}/responses`;
 	return `${normalized}/codex/responses`;
+}
+
+function resolveCodexCompactUrl(baseUrl?: string): string {
+	return `${resolveCodexUrl(baseUrl)}/compact`;
+}
+
+function getCompactedInput(model: Model<"openai-codex-responses">, context: Context): ResponseInput {
+	const state = context.providerState;
+	if (!state) return [];
+	if (
+		state.provider !== model.provider ||
+		state.api !== model.api ||
+		state.model !== model.id ||
+		normalizeCodexBaseUrl(state.baseUrl) !== normalizeCodexBaseUrl(model.baseUrl)
+	) {
+		throw new Error("Codex compacted context is incompatible with the selected model");
+	}
+	if (!Array.isArray(state.data)) {
+		throw new Error("Invalid Codex compacted context: data must be an array");
+	}
+	return state.data as ResponseInput;
+}
+
+function buildCompactionUsage(
+	model: Model<"openai-codex-responses">,
+	raw: NonNullable<CompactResponse["usage"]>,
+	serviceTier: ResponseCreateParamsStreaming["service_tier"] | undefined,
+): Usage {
+	const cacheRead = raw.input_tokens_details?.cached_tokens ?? 0;
+	const usage: Usage = {
+		input: Math.max(0, (raw.input_tokens ?? 0) - cacheRead),
+		output: raw.output_tokens ?? 0,
+		cacheRead,
+		cacheWrite: 0,
+		totalTokens: (raw.input_tokens ?? 0) + (raw.output_tokens ?? 0),
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	usage.cost = calculateCost(model, usage);
+	applyServiceTierPricing(usage, serviceTier, model);
+	return usage;
 }
 
 function resolveCodexWebSocketUrl(baseUrl?: string): string {

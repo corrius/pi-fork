@@ -223,6 +223,20 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
+export type ContextCompactionOptions = SimpleStreamOptions & Record<string, unknown>;
+
+export interface ProviderState<T = unknown> {
+	provider: ProviderId;
+	api: Api;
+	model: string;
+	baseUrl: string;
+	data: T;
+}
+
+export interface ContextCompactionResult<T = unknown> {
+	state: ProviderState<T>;
+	usage?: Usage;
+}
 
 export interface DeferredFetchOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
@@ -262,9 +276,9 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 	: StreamOptions & Record<string, unknown>;
 
 /**
- * The uniform stream contract of an API implementation module: every module
- * under `src/api/` exports `stream` and `streamSimple`; capable modules may also
- * export deferred-response methods. Lazy wrappers (`lazyApi()`) and provider
+ * The uniform stream contract of an API implementation module. Modules export
+ * `stream` and `streamSimple`; capable modules may also export one-shot context
+ * compaction and deferred-response methods. Lazy wrappers (`lazyApi()`) and provider
  * factories pass these around as values. This is the untyped dispatch shape;
  * per-API option typing lives on the implementation modules themselves and on
  * `Provider.stream()` via `ApiStreamOptions`.
@@ -272,6 +286,11 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 export interface ProviderStreams {
 	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
 	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+	compactContext?(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 	fetchDeferred?(
 		model: Model<Api>,
 		handle: DeferredHandle,
@@ -525,6 +544,7 @@ export interface Context {
 	systemPrompt?: string;
 	messages: Message[];
 	tools?: Tool[];
+	providerState?: ProviderState;
 }
 
 /**

@@ -33,6 +33,7 @@ Unified LLM API with provider collections, automatic auth resolution, token and 
   - [Unified Interface](#unified-interface-streamsimplecompletesimple)
   - [Provider-Specific Options](#provider-specific-options-streamcomplete)
   - [Streaming Thinking Content](#streaming-thinking-content)
+- [Native Context Compaction](#native-context-compaction)
 - [Stop Reasons](#stop-reasons)
 - [Error Handling](#error-handling)
   - [Aborting Requests](#aborting-requests)
@@ -912,6 +913,23 @@ for await (const event of s) {
 }
 ```
 
+## Native Context Compaction
+
+Providers may expose a one-shot `compactContext()` operation that returns opaque state for later requests. The initial implementation supports ChatGPT OAuth models using `openai-codex-responses`:
+
+```typescript
+const model = models.getModel('openai-codex', 'gpt-5.6-sol')!;
+const compacted = await models.compactContext(model, context, { reasoning: 'medium' });
+
+const response = await models.completeSimple(model, {
+  systemPrompt: context.systemPrompt,
+  providerState: compacted.state,
+  messages: [{ role: 'user', content: 'Continue', timestamp: Date.now() }],
+});
+```
+
+Provider state is identity-scoped to the provider, API, model, and base URL. The Codex implementation preserves every returned output item unchanged and prepends it to later messages. Unsupported providers reject `compactContext()` rather than falling back to another strategy.
+
 ## Stop Reasons
 
 Every `AssistantMessage` includes a `stopReason` field that indicates how the generation ended:
@@ -1168,7 +1186,7 @@ const ollamaReasoningModel: Model<'openai-completions'> = {
 
 ### Calling API Implementations Directly
 
-The API implementations are importable on their own. Each module exports exactly `stream` and `streamSimple` with that API's full option typing. Direct calls bypass provider auth — pass `apiKey` explicitly:
+The API implementations are importable on their own. Each module exports `stream` and `streamSimple` with that API's full option typing; APIs with additional one-shot operations export those too. Direct calls bypass provider auth — pass `apiKey` explicitly:
 
 ```typescript
 import { stream } from '@earendil-works/pi-ai/api/anthropic-messages';
@@ -1187,7 +1205,7 @@ Built-in API implementations live under `./api/<api-id>`:
 | `anthropic-messages` | `AnthropicOptions` |
 | `openai-completions` | `OpenAICompletionsOptions` |
 | `openai-responses` | `OpenAIResponsesOptions` |
-| `openai-codex-responses` | `OpenAICodexResponsesOptions` |
+| `openai-codex-responses` | `OpenAICodexResponsesOptions`; also exports `compactContext()` |
 | `azure-openai-responses` | `AzureOpenAIResponsesOptions` |
 | `google-generative-ai` | `GoogleOptions` |
 | `google-vertex` | `GoogleVertexOptions` |

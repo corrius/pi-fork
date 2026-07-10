@@ -177,6 +177,14 @@ describe("Models runtime", () => {
 		expect(models.getProviders()).toHaveLength(0);
 	});
 
+	it("reports unsupported context compaction separately from stream failures", async () => {
+		const model = testModel("p1", "m1");
+		const models = createModels();
+		models.setProvider(testProvider({ id: "p1", models: [model] }));
+
+		await expect(models.compactContext(model, context)).rejects.toMatchObject({ code: "compaction" });
+	});
+
 	it("lists and finds models per provider", async () => {
 		const models = createModels();
 		models.setProvider(testProvider({ id: "p1", models: [testModel("p1", "m1"), testModel("p1", "m2")] }));

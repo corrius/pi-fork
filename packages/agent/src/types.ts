@@ -7,6 +7,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ProviderState,
 	SimpleStreamOptions,
 	TextContent,
 	Tool,
@@ -338,6 +339,8 @@ export interface AgentState {
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
 	thinkingLevel: ThinkingLevel;
+	/** Opaque provider-owned state prepended to the next model request. */
+	providerState?: ProviderState;
 	/** Available tools. Assigning a new array copies the top-level array. */
 	set tools(tools: AgentTool<any>[]);
 	get tools(): AgentTool<any>[];
@@ -417,6 +420,8 @@ export interface AgentContext {
 	systemPrompt: string;
 	/** Transcript visible to the model. */
 	messages: AgentMessage[];
+	/** Opaque provider-owned state prepended to the model request. */
+	providerState?: ProviderState;
 	/** Tools available for this run. */
 	tools?: AgentTool<any>[];
 }

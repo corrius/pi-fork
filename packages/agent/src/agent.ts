@@ -1,4 +1,5 @@
 import type {
+	Context,
 	ImageContent,
 	Message,
 	Model,
@@ -7,7 +8,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { createLlmContext, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -75,6 +76,7 @@ function createMutableAgentState(
 		systemPrompt: initialState?.systemPrompt ?? "",
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		providerState: initialState?.providerState,
 		get tools() {
 			return tools;
 		},
@@ -261,6 +263,11 @@ export class Agent {
 		return this._state;
 	}
 
+	/** Build the exact provider context used for the next model request. */
+	async createLlmContext(signal?: AbortSignal): Promise<Context> {
+		return createLlmContext(this.createContextSnapshot(), this.createLoopConfig(), signal);
+	}
+
 	/** Controls how queued steering messages are drained. */
 	set steeringMode(mode: QueueMode) {
 		this.steeringQueue.mode = mode;
@@ -336,6 +343,7 @@ export class Agent {
 		}
 
 		this._state.messages = [];
+		this._state.providerState = undefined;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -439,6 +447,7 @@ export class Agent {
 			systemPrompt: this._state.systemPrompt,
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
+			providerState: this._state.providerState,
 		};
 	}
 

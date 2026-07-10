@@ -13,7 +13,14 @@ import type {
 	ProviderAuth,
 } from "./types.ts";
 
-export type ModelsErrorCode = "model_source" | "model_validation" | "provider" | "stream" | "auth" | "oauth";
+export type ModelsErrorCode =
+	| "model_source"
+	| "model_validation"
+	| "provider"
+	| "stream"
+	| "compaction"
+	| "auth"
+	| "oauth";
 
 export interface AuthResolutionOverrides {
 	apiKey?: string;
