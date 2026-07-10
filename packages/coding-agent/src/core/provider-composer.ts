@@ -117,6 +117,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 			: model.cost,
 		contextWindow: override.contextWindow ?? model.contextWindow,
 		maxTokens: override.maxTokens ?? model.maxTokens,
+		compaction: override.compaction ?? model.compaction,
 		compat: mergeCompat(model.compat, override.compat),
 	};
 }
@@ -153,6 +154,7 @@ function modelFromJson(
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,
+		compaction: definition.compaction ?? providerConfig.compaction,
 		headers: undefined,
 		compat: mergeCompat(providerConfig.compat, definition.compat),
 	};
@@ -173,19 +175,21 @@ function applyModelsJson(
 		!config.baseUrl &&
 		!config.headers &&
 		!config.compat &&
+		!config.compaction &&
 		!hasOverrides &&
 		!config.apiKey &&
 		!config.oauth &&
 		config.authHeader === undefined
 	) {
 		throw new Error(
-			`Provider ${providerId}: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".`,
+			`Provider ${providerId}: must specify "baseUrl", "headers", "compat", "compaction", "modelOverrides", or "models".`,
 		);
 	}
 
 	const models: Model<Api>[] = baseModels.map((model) => ({
 		...model,
 		baseUrl: config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl),
+		compaction: config.compaction ?? model.compaction,
 		compat: mergeCompat(model.compat, config.compat),
 	}));
 	for (const definition of config.models ?? []) {
@@ -495,6 +499,9 @@ export function composeModelProvider(
 			: undefined,
 		stream: (model, context, options) => streamWith(model, context, options, false),
 		streamSimple: (model, context, options) => streamWith(model, context, options, true),
+		compactContext: base?.compactContext
+			? (model, context, options) => base.compactContext!(model, context, options)
+			: undefined,
 	};
 }
 

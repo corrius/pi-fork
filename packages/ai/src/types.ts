@@ -739,6 +739,7 @@ export interface Model<TApi extends Api> {
 	cost: ModelCost;
 	contextWindow: number;
 	maxTokens: number;
+	compaction?: "summary" | "native";
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"

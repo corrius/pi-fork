@@ -334,10 +334,7 @@ export async function compactContext<TApi extends Api>(
 	context: Context,
 	options?: ContextCompactionOptions,
 ): Promise<ContextCompactionResult> {
-	if (shouldUseBuiltinModels(model)) {
-		return compatModels.compactContext(model, context, options);
-	}
-	const provider = resolveApiProvider(model.api);
+	const provider = getBuiltinProviderForModel(model) ?? resolveApiProvider(model.api);
 	if (!provider.compactContext) {
 		throw new Error(`API provider ${model.api} does not support native context compaction`);
 	}

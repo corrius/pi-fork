@@ -80,7 +80,12 @@ import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScop
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
-import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
+import {
+	getProviderStateTarget,
+	type SessionEntry,
+	SessionManager,
+	sessionEntryToContextMessages,
+} from "../../core/session-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -187,10 +192,16 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
-type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }>;
+type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" | "provider_checkpoint" }>;
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
+}
+
+function isProviderCheckpointEntry(
+	item: RenderSessionItem,
+): item is Extract<SessionEntry, { type: "provider_checkpoint" }> {
+	return "type" in item && item.type === "provider_checkpoint";
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -3058,13 +3069,15 @@ export class InteractiveMode {
 				} else if (event.result) {
 					this.chatContainer.clear();
 					this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-						),
-					);
+					if (!("type" in event.result)) {
+						this.addMessageToChat(
+							createCompactionSummaryMessage(
+								event.result.summary,
+								event.result.tokensBefore,
+								new Date().toISOString(),
+							),
+						);
+					}
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
@@ -3288,6 +3301,13 @@ export class InteractiveMode {
 				this.addCustomEntryToChat(item);
 				continue;
 			}
+			if (isProviderCheckpointEntry(item)) {
+				this.chatContainer.addChild(new Spacer(1));
+				this.chatContainer.addChild(
+					new Text(theme.fg("muted", `Context compacted by ${item.state.provider}/${item.state.model}`), 1, 0),
+				);
+				continue;
+			}
 
 			const message = item;
 			// Assistant messages need special handling for tool calls
@@ -3362,7 +3382,7 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
-			if (entry.type === "custom") {
+			if (entry.type === "custom" || entry.type === "provider_checkpoint") {
 				return [entry];
 			}
 			return sessionEntryToContextMessages(entry);
@@ -3400,7 +3420,7 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.buildContextEntries();
+		const entries = this.sessionManager.buildContextEntries(getProviderStateTarget(this.session.model));
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -3409,7 +3429,9 @@ export class InteractiveMode {
 
 		// Show compaction info if session was compacted
 		const allEntries = this.sessionManager.getEntries();
-		const compactionCount = allEntries.filter((e) => e.type === "compaction").length;
+		const compactionCount = allEntries.filter(
+			(e) => e.type === "compaction" || e.type === "provider_checkpoint",
+		).length;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Session compacted ${times}`);
@@ -3452,7 +3474,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderSessionEntries(this.sessionManager.buildContextEntries(getProviderStateTarget(this.session.model)));
 	}
 
 	// =========================================================================

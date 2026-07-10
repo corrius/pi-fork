@@ -6,7 +6,14 @@
  */
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	Context,
+	Model,
+	ProviderState,
+	SimpleStreamOptions,
+	Usage,
+} from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
 import {
@@ -92,6 +99,18 @@ export interface CompactionResult<T = unknown> {
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 }
+
+export interface ProviderCompactionResult {
+	type: "provider_checkpoint";
+	summary?: never;
+	firstKeptEntryId?: never;
+	state: ProviderState;
+	tokensBefore: number;
+	estimatedTokensAfter: number;
+	usage?: Usage;
+}
+
+export type SessionCompactionResult = CompactionResult | ProviderCompactionResult;
 
 // ============================================================================
 // Types
@@ -707,6 +726,36 @@ export function prepareCompaction(
 		tokensBefore,
 		previousSummary,
 		fileOps,
+		settings,
+	};
+}
+
+export function prepareNativeCompaction(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+	messages: AgentMessage[],
+	providerState: ProviderState | undefined,
+): CompactionPreparation | undefined {
+	const contextEntries = pathEntries.filter(
+		(entry) =>
+			entry.type === "message" ||
+			entry.type === "custom_message" ||
+			entry.type === "branch_summary" ||
+			entry.type === "compaction",
+	);
+	const preparation = prepareCompaction(contextEntries, settings);
+	if (preparation) return preparation;
+	if (!providerState && messages.length === 0) return undefined;
+
+	return {
+		firstKeptEntryId: pathEntries[pathEntries.length - 1]?.id ?? "",
+		messagesToSummarize: messages.slice(),
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		tokensBefore:
+			messages.reduce((tokens, message) => tokens + estimateTokens(message), 0) +
+			(providerState ? Math.ceil(JSON.stringify(providerState.data).length / 4) : 0),
+		fileOps: createFileOps(),
 		settings,
 	};
 }

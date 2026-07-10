@@ -548,7 +548,7 @@ class ModelsImpl implements MutableModels {
 			throw new ModelsError("compaction", `Provider ${provider.id} does not support native context compaction`);
 		}
 		const { requestModel, requestOptions } = await this.applyAuth(model, options);
-		return provider.compactContext(requestModel, context, requestOptions);
+		return provider.compactContext(requestModel, context, requestOptions as ContextCompactionOptions | undefined);
 	}
 }
 

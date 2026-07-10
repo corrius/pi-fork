@@ -9,6 +9,8 @@ import {
 	type AuthResult,
 	type AuthType,
 	type Context,
+	type ContextCompactionOptions,
+	type ContextCompactionResult,
 	type Credential,
 	type CredentialInfo,
 	type CredentialStore,
@@ -478,6 +480,21 @@ export class ModelRuntime implements Models {
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
 		return this.streamSimple(model, context, options).result();
+	}
+
+	async compactContext(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult> {
+		const prepared = await this.prepareRequest(model, options);
+		if (!prepared.provider.compactContext) {
+			throw new ModelsError(
+				"compaction",
+				`Provider ${prepared.provider.id} does not support native context compaction`,
+			);
+		}
+		return prepared.provider.compactContext(prepared.model, context, prepared.options as ContextCompactionOptions);
 	}
 
 	async login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {

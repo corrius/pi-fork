@@ -79,6 +79,44 @@ describe("computeCacheWaste", () => {
 		expect(totals.missedTokens).toBe(0);
 	});
 
+	it("skips the turn after a compatible provider checkpoint reset", () => {
+		const reset = {
+			type: "provider_checkpoint",
+			id: "c",
+			parentId: null,
+			timestamp: "",
+			state: {
+				provider: "test",
+				api: "anthropic-messages",
+				model: "test-model",
+				baseUrl: "https://example.com",
+				data: [],
+			},
+		} as SessionEntry;
+		const afterReset = assistant({ cacheWrite: 20_000, cost: { cacheWrite: 0.075 } });
+		const totals = computeCacheWaste([entry(turn1), reset, entry(afterReset)], models);
+		expect(totals.missedTokens).toBe(0);
+	});
+
+	it("counts a cache miss after an incompatible provider checkpoint", () => {
+		const reset = {
+			type: "provider_checkpoint",
+			id: "c",
+			parentId: null,
+			timestamp: "",
+			state: {
+				provider: "test",
+				api: "anthropic-messages",
+				model: "other-model",
+				baseUrl: "https://example.com",
+				data: [],
+			},
+		} as SessionEntry;
+		const afterReset = assistant({ cacheWrite: 100_000, cost: { cacheWrite: 0.375 } });
+		const totals = computeCacheWaste([entry(turn1), reset, entry(afterReset)], models);
+		expect(totals.missedTokens).toBe(100_000);
+	});
+
 	it("counts misses caused by model switches", () => {
 		const otherModel = assistant({ cacheWrite: 100_000, cost: { cacheWrite: 0.375 }, model: "other-model" });
 		const totals = computeCacheWaste([entry(turn1), entry(otherModel)], models);

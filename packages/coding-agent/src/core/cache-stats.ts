@@ -1,4 +1,4 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ProviderState } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "./session-manager.ts";
 
 /**
@@ -106,6 +106,7 @@ function scan(
 	models: ModelPriceSource,
 ): { prev: PreviousRequest | undefined; totals: CacheWasteTotals; misses: Map<AssistantMessage, CacheMiss> } {
 	let prev: PreviousRequest | undefined;
+	let pendingCheckpoint: ProviderState | undefined;
 	const totals: CacheWasteTotals = { missedTokens: 0, missedCost: 0, missCount: 0 };
 	const misses = new Map<AssistantMessage, CacheMiss>();
 
@@ -115,9 +116,23 @@ function scan(
 			// not re-billed content. Model switches are NOT exempt: they re-bill the
 			// full prompt and should be counted.
 			prev = undefined;
+			pendingCheckpoint = undefined;
+			continue;
+		}
+		if (entry.type === "provider_checkpoint") {
+			pendingCheckpoint = entry.state;
 			continue;
 		}
 		if (entry.type === "message" && entry.message.role === "assistant") {
+			if (
+				pendingCheckpoint &&
+				entry.message.provider === pendingCheckpoint.provider &&
+				entry.message.api === pendingCheckpoint.api &&
+				entry.message.model === pendingCheckpoint.model
+			) {
+				prev = undefined;
+			}
+			pendingCheckpoint = undefined;
 			const miss = detectMiss(prev, entry.message, models);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;

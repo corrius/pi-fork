@@ -13,7 +13,7 @@ import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
-import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
+import { getDefaultSessionDir, getProviderStateTarget, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
@@ -284,6 +284,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
+	const restoredSession = model ? sessionManager.buildSessionContext(getProviderStateTarget(model)) : existingSession;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
 	agent = new Agent({
@@ -292,6 +293,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model,
 			thinkingLevel,
 			tools: [],
+			providerState: restoredSession.providerState,
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
@@ -356,7 +358,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Restore messages if session has existing data
 	if (hasExistingSession) {
-		agent.state.messages = existingSession.messages;
+		agent.state.messages = restoredSession.messages;
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}

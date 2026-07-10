@@ -145,6 +145,8 @@ const ModelCostSchema = Type.Object({
 	tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
 });
 
+const CompactionModeSchema = Type.Union([Type.Literal("summary"), Type.Literal("native")]);
+
 const ModelDefinitionSchema = Type.Object({
 	id: Type.String({ minLength: 1 }),
 	name: Type.Optional(Type.String({ minLength: 1 })),
@@ -156,6 +158,7 @@ const ModelDefinitionSchema = Type.Object({
 	cost: Type.Optional(ModelCostSchema),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	compaction: Type.Optional(CompactionModeSchema),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -176,6 +179,7 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	compaction: Type.Optional(CompactionModeSchema),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -189,6 +193,7 @@ const ProviderConfigSchema = Type.Object({
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 	authHeader: Type.Optional(Type.Boolean()),
+	compaction: Type.Optional(CompactionModeSchema),
 	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
 	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
 });
