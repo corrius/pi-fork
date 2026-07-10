@@ -24,10 +24,18 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	ContextCompactionResult,
+	ImageContent,
+	Message,
+	Model,
+	TextContent,
+} from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	compactContext,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	isRetryableAssistantError,
@@ -42,14 +50,19 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	createFileOps,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	type ProviderCompactionResult,
 	prepareCompaction,
+	type SessionCompactionResult,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -85,9 +98,16 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { ModelRegistry } from "./model-registry.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	ProviderStateTarget,
+	SessionEntry,
+	SessionManager,
+} from "./session-manager.ts";
+import { CURRENT_SESSION_VERSION, getLatestCompactionBoundary, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -144,7 +164,7 @@ export type AgentSessionEvent =
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
-			result: CompactionResult | undefined;
+			result: SessionCompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
@@ -245,6 +265,16 @@ export interface SessionStats {
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
+}
+
+function getProviderStateTarget(model: Model<any> | undefined): ProviderStateTarget | undefined {
+	if (!model) return undefined;
+	return {
+		provider: model.provider,
+		api: model.api,
+		model: model.id,
+		baseUrl: model.baseUrl.replace(/\/+$/, ""),
+	};
 }
 
 function estimateMessagesTokens(messages: AgentMessage[]): number {
@@ -1529,6 +1559,12 @@ export class AgentSession {
 		});
 	}
 
+	private _restoreContextForModel(model: Model<any>): void {
+		const context = this.sessionManager.buildSessionContext(getProviderStateTarget(model));
+		this.agent.state.messages = context.messages;
+		this.agent.state.providerState = context.providerState;
+	}
+
 	/**
 	 * Set model directly.
 	 * Validates that auth is configured, saves to session and settings.
@@ -1543,6 +1579,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+		this._restoreContextForModel(model);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1580,6 +1617,7 @@ export class AgentSession {
 		// Apply model
 		this.agent.state.model = next.model;
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		this._restoreContextForModel(next.model);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		// Apply thinking level.
@@ -1608,6 +1646,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this._restoreContextForModel(nextModel);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1728,12 +1767,103 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _prepareCompaction(
+		pathEntries: SessionEntry[],
+		settings: CompactionSettings,
+		native: boolean,
+	): CompactionPreparation | undefined {
+		if (!native) return prepareCompaction(pathEntries, settings);
+
+		const contextEntries = pathEntries.filter(
+			(entry) =>
+				entry.type === "message" ||
+				entry.type === "custom_message" ||
+				entry.type === "branch_summary" ||
+				entry.type === "compaction",
+		);
+		const preparation = prepareCompaction(contextEntries, settings);
+		if (preparation) return preparation;
+		if (!this.agent.state.providerState && this.agent.state.messages.length === 0) return undefined;
+
+		return {
+			firstKeptEntryId: pathEntries[pathEntries.length - 1]?.id ?? "",
+			messagesToSummarize: this.agent.state.messages.slice(),
+			turnPrefixMessages: [],
+			isSplitTurn: false,
+			tokensBefore:
+				estimateMessagesTokens(this.agent.state.messages) +
+				(this.agent.state.providerState
+					? Math.ceil(JSON.stringify(this.agent.state.providerState.data).length / 4)
+					: 0),
+			fileOps: createFileOps(),
+			settings,
+		};
+	}
+
+	private async _compactProviderContext(
+		signal: AbortSignal,
+		excludedEntryIds?: string[],
+	): Promise<ProviderCompactionResult> {
+		const model = this.model;
+		if (!model) throw new Error(formatNoModelSelectedMessage());
+		const auth = await this._getRequiredRequestAuth(model);
+		let headers = mergeProviderAttributionHeaders(model, this.settingsManager, this.sessionId, auth.headers);
+		if (this._extensionRunner.hasHandlers("before_provider_headers")) {
+			headers = await this._extensionRunner.emitBeforeProviderHeaders(headers ?? {});
+		}
+
+		const providerContext = await this.agent.createLlmContext(signal);
+		const estimatedTokensBefore =
+			estimateMessagesTokens(this.agent.state.messages) +
+			(providerContext.providerState ? Math.ceil(JSON.stringify(providerContext.providerState.data).length / 4) : 0);
+		const providerRetrySettings = this.settingsManager.getProviderRetrySettings();
+		const result: ContextCompactionResult = await compactContext(model, providerContext, {
+			apiKey: auth.apiKey,
+			env: auth.env,
+			headers,
+			signal,
+			sessionId: this.sessionId,
+			reasoning: this.thinkingLevel,
+			timeoutMs: providerRetrySettings.timeoutMs,
+			maxRetries: providerRetrySettings.maxRetries,
+			maxRetryDelayMs: providerRetrySettings.maxRetryDelayMs,
+			onPayload: async (payload) => {
+				if (!this._extensionRunner.hasHandlers("before_provider_request")) return payload;
+				return this._extensionRunner.emitBeforeProviderRequest(payload);
+			},
+			onResponse: async (response) => {
+				if (!this._extensionRunner.hasHandlers("after_provider_response")) return;
+				await this._extensionRunner.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
+			},
+		});
+		if (signal.aborted) throw new Error("Compaction cancelled");
+
+		const tokensBefore = result.usage
+			? result.usage.input + result.usage.cacheRead + result.usage.cacheWrite
+			: estimatedTokensBefore;
+		this.sessionManager.appendProviderCheckpoint(result.state, tokensBefore, result.usage, excludedEntryIds);
+		const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(model));
+		this.agent.state.messages = sessionContext.messages;
+		this.agent.state.providerState = sessionContext.providerState;
+		return {
+			type: "provider_checkpoint",
+			state: result.state,
+			tokensBefore,
+			estimatedTokensAfter: Math.ceil(JSON.stringify(result.state.data).length / 4),
+			usage: result.usage,
+		};
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
-	 * @param customInstructions Optional instructions for the compaction summary
+	 * @param customInstructions Optional instructions for summary compaction. Native compaction does not support them.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<SessionCompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1743,21 +1873,21 @@ export class AgentSession {
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
-
-			const { apiKey, headers, env } = await this._getCompactionRequestAuth(this.model);
+			const native = this.model.compaction === "native";
+			const summaryAuth = native ? undefined : await this._getCompactionRequestAuth(this.model);
+			if (native && customInstructions) {
+				throw new Error("Custom compaction instructions are not supported by native compaction");
+			}
 
 			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
-				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
-				}
-				throw new Error("Nothing to compact (session too small)");
+			const lastEntry = pathEntries[pathEntries.length - 1];
+			const latestCompatibleBoundary = getLatestCompactionBoundary(pathEntries, getProviderStateTarget(this.model));
+			if (lastEntry?.type === "compaction" || latestCompatibleBoundary?.id === lastEntry?.id) {
+				throw new Error("Already compacted");
 			}
+			const settings = this.settingsManager.getCompactionSettings();
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) throw new Error("Nothing to compact (session too small)");
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -1770,19 +1900,43 @@ export class AgentSession {
 					customInstructions,
 					reason: "manual",
 					willRetry: false,
+					mode: native ? "native" : "summary",
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
-				if (result?.cancel) {
-					throw new Error("Compaction cancelled");
-				}
-
+				if (result?.cancel) throw new Error("Compaction cancelled");
 				if (result?.compaction) {
 					extensionCompaction = result.compaction;
 					fromExtension = true;
 				}
 			}
 
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const result = await this._compactProviderContext(this._compactionAbortController.signal);
+				const checkpointEntry = this.sessionManager.getLeafEntry();
+				if (checkpointEntry?.type === "provider_checkpoint") {
+					await this._extensionRunner.emit({
+						type: "session_compact",
+						compactionEntry: checkpointEntry,
+						fromExtension: false,
+						reason: "manual",
+						willRetry: false,
+					});
+				}
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result,
+					aborted: false,
+					willRetry: false,
+				});
+				return result;
+			}
+
+			const { apiKey, headers, env } = summaryAuth!;
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -1819,8 +1973,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
@@ -1916,7 +2071,10 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionBoundary(
+			this.sessionManager.getBranch(),
+			getProviderStateTarget(this.model),
+		);
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
@@ -2000,32 +2158,14 @@ export class AgentSession {
 				return false;
 			}
 
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFn === streamSimple) {
-				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
-				if (!authResult.ok || !authResult.apiKey) {
-					return false;
-				}
-				apiKey = authResult.apiKey;
-				headers = authResult.headers;
-				env = authResult.env;
-			} else {
-				({ apiKey, headers, env } = await this._getCompactionRequestAuth(this.model));
-			}
-
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
+			const native = this.model.compaction === "native";
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) return false;
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
-
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
@@ -2037,6 +2177,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
+					mode: native ? "native" : "summary",
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
@@ -2055,6 +2196,50 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const leaf = this.sessionManager.getLeafEntry();
+				const excludedEntryIds =
+					reason === "overflow" &&
+					willRetry &&
+					leaf?.type === "message" &&
+					leaf.message.role === "assistant" &&
+					leaf.message.stopReason === "error"
+						? [leaf.id]
+						: undefined;
+				const result = await this._compactProviderContext(
+					this._autoCompactionAbortController.signal,
+					excludedEntryIds,
+				);
+				const checkpointEntry = this.sessionManager.getLeafEntry();
+				if (checkpointEntry?.type === "provider_checkpoint") {
+					await this._extensionRunner.emit({
+						type: "session_compact",
+						compactionEntry: checkpointEntry,
+						fromExtension: false,
+						reason,
+						willRetry,
+					});
+				}
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				return willRetry || this.agent.hasQueuedMessages();
+			}
+
+			let apiKey: string | undefined;
+			let headers: Record<string, string> | undefined;
+			let env: Record<string, string> | undefined;
+			if (this.agent.streamFn === streamSimple) {
+				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
+				if (!authResult.ok || !authResult.apiKey) return false;
+				apiKey = authResult.apiKey;
+				headers = authResult.headers;
+				env = authResult.env;
+			} else {
+				({ apiKey, headers, env } = await this._getCompactionRequestAuth(this.model));
 			}
 
 			let summary: string;
@@ -2100,8 +2285,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
@@ -2273,6 +2459,7 @@ export class AgentSession {
 		}
 
 		this.agent.state.model = refreshedModel;
+		this._restoreContextForModel(refreshedModel);
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -2964,8 +3151,9 @@ export class AgentSession {
 			}
 
 			// Update agent state
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({
@@ -3033,6 +3221,14 @@ export class AgentSession {
 		let totalCost = 0;
 
 		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type === "provider_checkpoint" && entry.usage) {
+				totalInput += entry.usage.input;
+				totalOutput += entry.usage.output;
+				totalCacheRead += entry.usage.cacheRead;
+				totalCacheWrite += entry.usage.cacheWrite;
+				totalCost += entry.usage.cost.total;
+				continue;
+			}
 			if (entry.type !== "message") continue;
 			totalMessages++;
 			const message = entry.message;
@@ -3086,7 +3282,7 @@ export class AgentSession {
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
 		const branchEntries = this.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const latestCompaction = getLatestCompactionBoundary(branchEntries, getProviderStateTarget(model));
 
 		if (latestCompaction) {
 			// Check if there's a valid assistant usage after the compaction boundary

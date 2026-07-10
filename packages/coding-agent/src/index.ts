@@ -53,7 +53,9 @@ export {
 	generateBranchSummary,
 	generateSummary,
 	getLastAssistantUsage,
+	type ProviderCompactionResult,
 	prepareBranchEntries,
+	type SessionCompactionResult,
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";
@@ -230,6 +232,7 @@ export {
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
+	type ProviderCheckpointEntry,
 	parseSessionEntries,
 	type SessionContext,
 	type SessionEntry,

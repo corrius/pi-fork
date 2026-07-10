@@ -171,6 +171,8 @@ const ModelCostSchema = Type.Object({
 	tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
 });
 
+const CompactionModeSchema = Type.Union([Type.Literal("summary"), Type.Literal("native")]);
+
 // Schema for custom model definition
 // Most fields are optional with sensible defaults for local models (Ollama, LM Studio, etc.)
 const ModelDefinitionSchema = Type.Object({
@@ -184,6 +186,7 @@ const ModelDefinitionSchema = Type.Object({
 	cost: Type.Optional(ModelCostSchema),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	compaction: Type.Optional(CompactionModeSchema),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -205,6 +208,7 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	compaction: Type.Optional(CompactionModeSchema),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -219,6 +223,7 @@ const ProviderConfigSchema = Type.Object({
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 	authHeader: Type.Optional(Type.Boolean()),
+	compaction: Type.Optional(CompactionModeSchema),
 	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
 	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
 });
@@ -248,6 +253,7 @@ function formatValidationPath(error: TLocalizedValidationError): string {
 interface ProviderOverride {
 	baseUrl?: string;
 	compat?: Model<Api>["compat"];
+	compaction?: Model<Api>["compaction"];
 }
 
 interface ProviderRequestConfig {
@@ -336,6 +342,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	if (override.compaction !== undefined) result.compaction = override.compaction;
 
 	// Merge cost (partial override)
 	if (override.cost) {
@@ -458,6 +465,7 @@ export class ModelRegistry {
 						...model,
 						baseUrl: providerOverride.baseUrl ?? model.baseUrl,
 						compat: mergeCompat(model.compat, providerOverride.compat),
+						compaction: providerOverride.compaction ?? model.compaction,
 					};
 				}
 
@@ -522,10 +530,11 @@ export class ModelRegistry {
 			const modelOverrides = new Map<string, Map<string, ModelOverride>>();
 
 			for (const [providerName, providerConfig] of Object.entries(config.providers)) {
-				if (providerConfig.baseUrl || providerConfig.compat) {
+				if (providerConfig.baseUrl || providerConfig.compat || providerConfig.compaction) {
 					overrides.set(providerName, {
 						baseUrl: providerConfig.baseUrl,
 						compat: providerConfig.compat,
+						compaction: providerConfig.compaction,
 					});
 				}
 
@@ -562,9 +571,15 @@ export class ModelRegistry {
 
 			if (models.length === 0) {
 				// Override-only config: needs baseUrl, headers, compat, modelOverrides, or some combination.
-				if (!providerConfig.baseUrl && !providerConfig.headers && !providerConfig.compat && !hasModelOverrides) {
+				if (
+					!providerConfig.baseUrl &&
+					!providerConfig.headers &&
+					!providerConfig.compat &&
+					!providerConfig.compaction &&
+					!hasModelOverrides
+				) {
 					throw new Error(
-						`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "modelOverrides", or "models".`,
+						`Provider ${providerName}: must specify "baseUrl", "headers", "compat", "compaction", "modelOverrides", or "models".`,
 					);
 				}
 			} else if (!isBuiltIn) {
@@ -642,6 +657,7 @@ export class ModelRegistry {
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
 					maxTokens: modelDef.maxTokens ?? 16384,
+					compaction: modelDef.compaction ?? providerConfig.compaction,
 					headers: undefined,
 					compat,
 				} as Model<Api>);

@@ -138,6 +138,7 @@ Set `api` at provider level (default for all models) or model level (override pe
 | `apiKey` | Optional API key config (see value resolution below). Omit it when auth is provided by `/login`/`auth.json` or CLI `--api-key`. |
 | `headers` | Custom headers (see value resolution below) |
 | `authHeader` | Set `true` to add `Authorization: Bearer <apiKey>` automatically |
+| `compaction` | Compaction mode for this provider: `"summary"` (default) or `"native"` |
 | `models` | Array of model configurations |
 | `modelOverrides` | Per-model overrides for built-in or extension-registered models on this provider |
 
@@ -205,6 +206,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `input` | No | `["text"]` | Input types: `["text"]` or `["text", "image"]` |
 | `contextWindow` | No | `128000` | Context window size in tokens |
 | `maxTokens` | No | `16384` | Maximum output tokens |
+| `compaction` | No | provider `compaction` or `"summary"` | Compaction mode: `"summary"` or `"native"` |
 | `cost` | No | all zeros | Per-million-token rates with optional request-wide input pricing tiers |
 | `compat` | No | provider `compat` | Provider compatibility overrides. Merged with provider-level `compat` when both are set. |
 
@@ -337,7 +339,7 @@ Use `modelOverrides` to customize built-in models and matching extension-registe
 }
 ```
 
-`modelOverrides` supports these fields per model: `name`, `reasoning`, `thinkingLevelMap`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
+`modelOverrides` supports these fields per model: `name`, `reasoning`, `thinkingLevelMap`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `compaction`, `headers`, `compat`.
 
 Direct OpenAI GPT-5.6 Sol, Terra, and Luna default to a `272000` context window so requests remain within OpenAI's short-context pricing tier. To opt into OpenAI's 1.05M context window, increase it for each model you use:
 
@@ -363,6 +365,29 @@ Behavior notes:
 - You can combine provider-level `baseUrl`/`headers` with `modelOverrides`.
 - Overriding `name` changes model matching and secondary detail text only; the footer and primary model lists continue to show the model `id`.
 - If `models` is also defined for a provider, custom models are merged after built-in overrides. A custom model with the same `id` replaces the overridden built-in model entry.
+
+## Native OpenAI Codex Compaction
+
+`openai-codex` models authenticated through ChatGPT OAuth can use OpenAI's standalone Codex compaction endpoint instead of generating a text summary:
+
+```json
+{
+  "providers": {
+    "openai-codex": {
+      "compaction": "native",
+      "modelOverrides": {
+        "gpt-5.6-sol": {
+          "compaction": "summary"
+        }
+      }
+    }
+  }
+}
+```
+
+Provider-level configuration applies to all models and `modelOverrides` can select a different mode for one model. Native compaction currently supports only the `openai-codex-responses` API. Selecting it for another API produces an error rather than falling back to summary compaction.
+
+Manual, threshold, and overflow compaction all call `/backend-api/codex/responses/compact`. Pi stores the complete returned output as an opaque checkpoint and replays it before messages added later. The original session entries remain intact for branching and for switching to an incompatible provider, API, model, or base URL. Custom `/compact` instructions are not supported in native mode.
 
 ## Anthropic Messages Compatibility
 

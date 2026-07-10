@@ -644,6 +644,23 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("modelOverrides (per-model customization)", () => {
+		test("model compaction overrides the provider default", () => {
+			writeRawModelsJson({
+				"openai-codex": {
+					compaction: "native",
+					modelOverrides: {
+						"gpt-5.6-sol": { compaction: "summary" },
+					},
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const models = getModelsForProvider(registry, "openai-codex");
+
+			expect(models.find((model) => model.id === "gpt-5.6-sol")?.compaction).toBe("summary");
+			expect(models.find((model) => model.id !== "gpt-5.6-sol")?.compaction).toBe("native");
+		});
+
 		test("model override applies to a single built-in model", () => {
 			writeRawModelsJson({
 				openrouter: {

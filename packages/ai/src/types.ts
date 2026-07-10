@@ -185,6 +185,20 @@ export interface StreamOptions {
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
+export type ContextCompactionOptions = StreamOptions & Record<string, unknown>;
+
+export interface ProviderState<T = unknown> {
+	provider: ProviderId;
+	api: Api;
+	model: string;
+	baseUrl: string;
+	data: T;
+}
+
+export interface ContextCompactionResult<T = unknown> {
+	state: ProviderState<T>;
+	usage?: Usage;
+}
 
 /**
  * Maps known APIs to their full provider-specific stream option types.
@@ -222,6 +236,11 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 export interface ProviderStreams {
 	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
 	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+	compactContext?(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 /**
@@ -440,6 +459,7 @@ export interface Context {
 	systemPrompt?: string;
 	messages: Message[];
 	tools?: Tool[];
+	providerState?: ProviderState;
 }
 
 /**
@@ -696,6 +716,7 @@ export interface Model<TApi extends Api> {
 	cost: ModelCost;
 	contextWindow: number;
 	maxTokens: number;
+	compaction?: "summary" | "native";
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"

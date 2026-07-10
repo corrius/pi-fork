@@ -1,4 +1,5 @@
 import {
+	type Context,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -74,6 +75,7 @@ function createMutableAgentState(
 		systemPrompt: initialState?.systemPrompt ?? "",
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		providerState: initialState?.providerState,
 		get tools() {
 			return tools;
 		},
@@ -252,6 +254,18 @@ export class Agent {
 		return this._state;
 	}
 
+	/** Build the exact provider context used for the next model request. */
+	async createLlmContext(signal?: AbortSignal): Promise<Context> {
+		let messages = this._state.messages;
+		if (this.transformContext) messages = await this.transformContext(messages, signal);
+		return {
+			systemPrompt: this._state.systemPrompt,
+			messages: await this.convertToLlm(messages),
+			tools: this._state.tools,
+			providerState: this._state.providerState,
+		};
+	}
+
 	/** Controls how queued steering messages are drained. */
 	set steeringMode(mode: QueueMode) {
 		this.steeringQueue.mode = mode;
@@ -323,6 +337,7 @@ export class Agent {
 	/** Clear transcript state, runtime state, and queued messages. */
 	reset(): void {
 		this._state.messages = [];
+		this._state.providerState = undefined;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -426,6 +441,7 @@ export class Agent {
 			systemPrompt: this._state.systemPrompt,
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
+			providerState: this._state.providerState,
 		};
 	}
 

@@ -299,6 +299,7 @@ async function streamAssistantResponse(
 		systemPrompt: context.systemPrompt,
 		messages: llmMessages,
 		tools: context.tools,
+		providerState: context.providerState,
 	};
 
 	const streamFunction = streamFn || streamSimple;

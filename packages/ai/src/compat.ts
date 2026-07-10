@@ -45,6 +45,8 @@ import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
+	ContextCompactionOptions,
+	ContextCompactionResult,
 	Model,
 	ProviderStreamOptions,
 	ProviderStreams,
@@ -78,12 +80,22 @@ export interface ApiProvider<TApi extends Api = Api, TOptions extends StreamOpti
 	api: TApi;
 	stream: StreamFunction<TApi, TOptions>;
 	streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
+	compactContext?(
+		model: Model<TApi>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 interface ApiProviderInternal {
 	api: Api;
 	stream: ApiStreamFunction;
 	streamSimple: ApiStreamSimpleFunction;
+	compactContext?(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 type RegisteredApiProvider = {
@@ -126,6 +138,18 @@ export function registerApiProvider<TApi extends Api, TOptions extends StreamOpt
 			api: provider.api,
 			stream: wrapStream(provider.api, provider.stream),
 			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
+			compactContext: provider.compactContext
+				? (model, context, options) => {
+						if (model.api !== provider.api) {
+							throw new Error(`Mismatched api: ${model.api} expected ${provider.api}`);
+						}
+						return provider.compactContext?.(
+							model as Model<TApi>,
+							context,
+							options,
+						) as Promise<ContextCompactionResult>;
+					}
+				: undefined,
 		},
 		sourceId,
 	});
@@ -191,7 +215,12 @@ const builtinApiProviderInstances = new Map<Api, ReturnType<typeof getApiProvide
 export function registerBuiltInApiProviders(): void {
 	for (const [api, streams] of BUILTIN_APIS) {
 		if (!getApiProvider(api)) {
-			registerApiProvider({ api, stream: streams.stream, streamSimple: streams.streamSimple });
+			registerApiProvider({
+				api,
+				stream: streams.stream,
+				streamSimple: streams.streamSimple,
+				compactContext: streams.compactContext,
+			});
 		}
 		builtinApiProviderInstances.set(api, getApiProvider(api));
 	}
@@ -274,4 +303,19 @@ export async function completeSimple<TApi extends Api>(
 ): Promise<AssistantMessage> {
 	const s = streamSimple(model, context, options);
 	return s.result();
+}
+
+export async function compactContext<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: ContextCompactionOptions,
+): Promise<ContextCompactionResult> {
+	if (shouldUseBuiltinModels(model)) {
+		return compatModels.compactContext(model, context, options);
+	}
+	const provider = resolveApiProvider(model.api);
+	if (!provider.compactContext) {
+		throw new Error(`API provider ${model.api} does not support native context compaction`);
+	}
+	return provider.compactContext(model, context, withEnvApiKey(model, options));
 }

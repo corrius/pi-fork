@@ -6,7 +6,14 @@
  */
 
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	Context,
+	Model,
+	ProviderState,
+	SimpleStreamOptions,
+	Usage,
+} from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import { convertToLlm } from "../messages.ts";
 import {
@@ -92,6 +99,18 @@ export interface CompactionResult<T = unknown> {
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 }
+
+export interface ProviderCompactionResult {
+	type: "provider_checkpoint";
+	summary?: never;
+	firstKeptEntryId?: never;
+	state: ProviderState;
+	tokensBefore: number;
+	estimatedTokensAfter: number;
+	usage?: Usage;
+}
+
+export type SessionCompactionResult = CompactionResult | ProviderCompactionResult;
 
 // ============================================================================
 // Types
