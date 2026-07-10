@@ -730,6 +730,36 @@ export function prepareCompaction(
 	};
 }
 
+export function prepareNativeCompaction(
+	pathEntries: SessionEntry[],
+	settings: CompactionSettings,
+	messages: AgentMessage[],
+	providerState: ProviderState | undefined,
+): CompactionPreparation | undefined {
+	const contextEntries = pathEntries.filter(
+		(entry) =>
+			entry.type === "message" ||
+			entry.type === "custom_message" ||
+			entry.type === "branch_summary" ||
+			entry.type === "compaction",
+	);
+	const preparation = prepareCompaction(contextEntries, settings);
+	if (preparation) return preparation;
+	if (!providerState && messages.length === 0) return undefined;
+
+	return {
+		firstKeptEntryId: pathEntries[pathEntries.length - 1]?.id ?? "",
+		messagesToSummarize: messages.slice(),
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		tokensBefore:
+			messages.reduce((tokens, message) => tokens + estimateTokens(message), 0) +
+			(providerState ? Math.ceil(JSON.stringify(providerState.data).length / 4) : 0),
+		fileOps: createFileOps(),
+		settings,
+	};
+}
+
 // ============================================================================
 // Main compaction function
 // ============================================================================

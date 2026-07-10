@@ -56,12 +56,12 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
-	createFileOps,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
 	type ProviderCompactionResult,
 	prepareCompaction,
+	prepareNativeCompaction,
 	type SessionCompactionResult,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -100,14 +100,14 @@ import type { ModelRegistry } from "./model-registry.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
-import type {
-	BranchSummaryEntry,
-	CompactionEntry,
-	ProviderStateTarget,
-	SessionEntry,
-	SessionManager,
+import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionBoundary,
+	getProviderStateTarget,
+	isProviderStateCompatible,
+	type SessionHeader,
 } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionBoundary, type SessionHeader } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -265,16 +265,6 @@ export interface SessionStats {
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
-}
-
-function getProviderStateTarget(model: Model<any> | undefined): ProviderStateTarget | undefined {
-	if (!model) return undefined;
-	return {
-		provider: model.provider,
-		api: model.api,
-		model: model.id,
-		baseUrl: model.baseUrl.replace(/\/+$/, ""),
-	};
 }
 
 function estimateMessagesTokens(messages: AgentMessage[]): number {
@@ -508,12 +498,20 @@ export class AgentSession {
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-			const previousContext = previousSnapshot?.context ?? turn.context;
+			const currentModel = this.agent.state.model;
+			const modelChanged =
+				currentModel !== undefined &&
+				(currentModel.provider !== turn.message.provider ||
+					currentModel.api !== turn.message.api ||
+					currentModel.id !== turn.message.model);
+			const nextContext = modelChanged
+				? await this.agent.createLlmContext(signal)
+				: (previousSnapshot?.context ?? turn.context);
 
 			return {
 				...previousSnapshot,
 				context: {
-					...previousContext,
+					...nextContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
@@ -573,6 +571,7 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
+	private _contextRestoreRevision = 0;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -597,6 +596,8 @@ export class AgentSession {
 				}
 			}
 		}
+
+		const contextRestoreRevisionBeforeExtension = this._contextRestoreRevision;
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
@@ -644,6 +645,11 @@ export class AgentSession {
 					});
 					this._retryAttempt = 0;
 				}
+			}
+
+			const selectedModel = this.model;
+			if (selectedModel && this._contextRestoreRevision !== contextRestoreRevisionBeforeExtension) {
+				this._restoreContextForModel(selectedModel);
 			}
 		}
 	};
@@ -1560,6 +1566,7 @@ export class AgentSession {
 	}
 
 	private _restoreContextForModel(model: Model<any>): void {
+		this._contextRestoreRevision++;
 		const context = this.sessionManager.buildSessionContext(getProviderStateTarget(model));
 		this.agent.state.messages = context.messages;
 		this.agent.state.providerState = context.providerState;
@@ -1772,35 +1779,14 @@ export class AgentSession {
 		settings: CompactionSettings,
 		native: boolean,
 	): CompactionPreparation | undefined {
-		if (!native) return prepareCompaction(pathEntries, settings);
-
-		const contextEntries = pathEntries.filter(
-			(entry) =>
-				entry.type === "message" ||
-				entry.type === "custom_message" ||
-				entry.type === "branch_summary" ||
-				entry.type === "compaction",
-		);
-		const preparation = prepareCompaction(contextEntries, settings);
-		if (preparation) return preparation;
-		if (!this.agent.state.providerState && this.agent.state.messages.length === 0) return undefined;
-
-		return {
-			firstKeptEntryId: pathEntries[pathEntries.length - 1]?.id ?? "",
-			messagesToSummarize: this.agent.state.messages.slice(),
-			turnPrefixMessages: [],
-			isSplitTurn: false,
-			tokensBefore:
-				estimateMessagesTokens(this.agent.state.messages) +
-				(this.agent.state.providerState
-					? Math.ceil(JSON.stringify(this.agent.state.providerState.data).length / 4)
-					: 0),
-			fileOps: createFileOps(),
-			settings,
-		};
+		return native
+			? prepareNativeCompaction(pathEntries, settings, this.agent.state.messages, this.agent.state.providerState)
+			: prepareCompaction(pathEntries, settings);
 	}
 
 	private async _compactProviderContext(
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
 		signal: AbortSignal,
 		excludedEntryIds?: string[],
 	): Promise<ProviderCompactionResult> {
@@ -1823,7 +1809,7 @@ export class AgentSession {
 			headers,
 			signal,
 			sessionId: this.sessionId,
-			reasoning: this.thinkingLevel,
+			reasoning: this.thinkingLevel === "off" ? undefined : this.thinkingLevel,
 			timeoutMs: providerRetrySettings.timeoutMs,
 			maxRetries: providerRetrySettings.maxRetries,
 			maxRetryDelayMs: providerRetrySettings.maxRetryDelayMs,
@@ -1841,14 +1827,28 @@ export class AgentSession {
 			},
 		});
 		if (signal.aborted) throw new Error("Compaction cancelled");
+		const stateTarget = getProviderStateTarget(model);
+		if (!isProviderStateCompatible(result.state, stateTarget)) {
+			throw new Error("Provider returned context state for a different provider, API, model, or base URL");
+		}
 
 		const tokensBefore = result.usage
 			? result.usage.input + result.usage.cacheRead + result.usage.cacheWrite
 			: estimatedTokensBefore;
 		this.sessionManager.appendProviderCheckpoint(result.state, tokensBefore, result.usage, excludedEntryIds);
-		const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(model));
+		const sessionContext = this.sessionManager.buildSessionContext(stateTarget);
 		this.agent.state.messages = sessionContext.messages;
 		this.agent.state.providerState = sessionContext.providerState;
+		const checkpointEntry = this.sessionManager.getLeafEntry();
+		if (checkpointEntry?.type === "provider_checkpoint") {
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: checkpointEntry,
+				fromExtension: false,
+				reason,
+				willRetry,
+			});
+		}
 		return {
 			type: "provider_checkpoint",
 			state: result.state,
@@ -1915,17 +1915,7 @@ export class AgentSession {
 				if (extensionCompaction) {
 					throw new Error("Extension-provided summaries are not supported by native compaction");
 				}
-				const result = await this._compactProviderContext(this._compactionAbortController.signal);
-				const checkpointEntry = this.sessionManager.getLeafEntry();
-				if (checkpointEntry?.type === "provider_checkpoint") {
-					await this._extensionRunner.emit({
-						type: "session_compact",
-						compactionEntry: checkpointEntry,
-						fromExtension: false,
-						reason: "manual",
-						willRetry: false,
-					});
-				}
+				const result = await this._compactProviderContext("manual", false, this._compactionAbortController.signal);
 				this._emit({
 					type: "compaction_end",
 					reason: "manual",
@@ -2106,13 +2096,18 @@ export class AgentSession {
 			}
 
 			this._overflowRecoveryAttempted = true;
-			// Remove the error message from agent state (it IS saved to session for history,
+			// Remove the overflow response from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			const overflowEntry = this.sessionManager.getLeafEntry();
+			const excludedEntryIds =
+				overflowEntry?.type === "message" && overflowEntry.message === assistantMessage
+					? [overflowEntry.id]
+					: undefined;
+			return await this._runAutoCompaction("overflow", willRetry, excludedEntryIds);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2149,7 +2144,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		excludedEntryIds?: string[],
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2202,29 +2201,12 @@ export class AgentSession {
 				if (extensionCompaction) {
 					throw new Error("Extension-provided summaries are not supported by native compaction");
 				}
-				const leaf = this.sessionManager.getLeafEntry();
-				const excludedEntryIds =
-					reason === "overflow" &&
-					willRetry &&
-					leaf?.type === "message" &&
-					leaf.message.role === "assistant" &&
-					leaf.message.stopReason === "error"
-						? [leaf.id]
-						: undefined;
 				const result = await this._compactProviderContext(
+					reason,
+					willRetry,
 					this._autoCompactionAbortController.signal,
 					excludedEntryIds,
 				);
-				const checkpointEntry = this.sessionManager.getLeafEntry();
-				if (checkpointEntry?.type === "provider_checkpoint") {
-					await this._extensionRunner.emit({
-						type: "session_compact",
-						compactionEntry: checkpointEntry,
-						fromExtension: false,
-						reason,
-						willRetry,
-					});
-				}
 				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 				return willRetry || this.agent.hasQueuedMessages();
 			}
@@ -2234,7 +2216,16 @@ export class AgentSession {
 			let env: Record<string, string> | undefined;
 			if (this.agent.streamFn === streamSimple) {
 				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
-				if (!authResult.ok || !authResult.apiKey) return false;
+				if (!authResult.ok || !authResult.apiKey) {
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: true,
+						willRetry: false,
+					});
+					return false;
+				}
 				apiKey = authResult.apiKey;
 				headers = authResult.headers;
 				env = authResult.env;

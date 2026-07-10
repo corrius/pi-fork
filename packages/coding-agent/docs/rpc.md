@@ -380,7 +380,31 @@ Response:
 }
 ```
 
-`estimatedTokensAfter` is a heuristic estimate over the rebuilt message context immediately after compaction, not a provider-exact token count.
+`estimatedTokensAfter` is a heuristic estimate over the rebuilt context immediately after compaction, not a provider-exact token count.
+
+Models configured for native compaction return a provider checkpoint instead of a summary:
+
+```json
+{
+  "type": "response",
+  "command": "compact",
+  "success": true,
+  "data": {
+    "type": "provider_checkpoint",
+    "state": {
+      "provider": "openai-codex",
+      "api": "openai-codex-responses",
+      "model": "gpt-5.6-sol",
+      "baseUrl": "https://chatgpt.com/backend-api",
+      "data": []
+    },
+    "tokensBefore": 150000,
+    "estimatedTokensAfter": 32000
+  }
+}
+```
+
+`state.data` is opaque provider output. Native mode rejects `customInstructions`.
 
 #### set_auto_compaction
 

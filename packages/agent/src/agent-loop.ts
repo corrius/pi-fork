@@ -274,6 +274,21 @@ async function runLoop(
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
+export async function createLlmContext(
+	context: AgentContext,
+	config: Pick<AgentLoopConfig, "transformContext" | "convertToLlm">,
+	signal?: AbortSignal,
+): Promise<Context> {
+	let messages = context.messages;
+	if (config.transformContext) messages = await config.transformContext(messages, signal);
+	return {
+		systemPrompt: context.systemPrompt,
+		messages: await config.convertToLlm(messages),
+		tools: context.tools,
+		providerState: context.providerState,
+	};
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -285,22 +300,7 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-		providerState: context.providerState,
-	};
+	const llmContext = await createLlmContext(context, config, signal);
 
 	const streamFunction = streamFn || streamSimple;
 

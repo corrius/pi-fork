@@ -389,6 +389,8 @@ Provider-level configuration applies to all models and `modelOverrides` can sele
 
 Manual, threshold, and overflow compaction all call `/backend-api/codex/responses/compact`. Pi stores the complete returned output as an opaque checkpoint and replays it before messages added later. The original session entries remain intact for branching and for switching to an incompatible provider, API, model, or base URL. Custom `/compact` instructions are not supported in native mode.
 
+Pi intentionally preserves every returned item, including `developer` items; unlike Codex CLI, it does not filter or rewrite compacted output before replay. Pi also does not locally rewrite oversized tool outputs before calling the compact endpoint. The endpoint requires its input to fit the model context window, so such overflow requests fail visibly without falling back to summary compaction.
+
 ## Anthropic Messages Compatibility
 
 For providers or proxies using `api: "anthropic-messages"`, use `compat` to control Anthropic-specific request compatibility.

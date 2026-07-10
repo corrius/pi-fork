@@ -494,9 +494,8 @@ export async function compactContext(
 	}
 
 	const accountId = extractAccountId(apiKey);
-	const simpleOptions = options as SimpleStreamOptions;
-	const base = buildBaseOptions(model, context, simpleOptions, apiKey);
-	const clampedReasoning = simpleOptions.reasoning ? clampThinkingLevel(model, simpleOptions.reasoning) : undefined;
+	const base = buildBaseOptions(model, context, options, apiKey);
+	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
 	const requestOptions: OpenAICodexResponsesOptions = {
 		...base,
 		reasoningEffort: clampedReasoning === "off" ? undefined : clampedReasoning,
@@ -518,14 +517,13 @@ export async function compactContext(
 
 	const headers = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
 	headers.set("accept", "application/json");
-	let response: Response;
+	let compacted: CompactResponse;
 	try {
-		response = await postCodexCompactRequest(model, body, headers, options);
+		compacted = await postCodexCompactRequest(model, body, headers, options);
 	} catch (error) {
 		if (options?.signal?.aborted) throw new DOMException("Request was aborted", "AbortError");
 		throw error;
 	}
-	const compacted = (await response.json()) as CompactResponse;
 	if (!Array.isArray(compacted.output)) {
 		throw new Error("Invalid Codex compact response: output must be an array");
 	}
@@ -547,7 +545,7 @@ async function postCodexCompactRequest(
 	body: RequestBody,
 	headers: Headers,
 	options?: ContextCompactionOptions,
-): Promise<Response> {
+): Promise<CompactResponse> {
 	const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
 	const timeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 
@@ -555,47 +553,75 @@ async function postCodexCompactRequest(
 		if (options?.signal?.aborted) throw new Error("Request was aborted");
 		const timeoutSignal = timeoutMs !== undefined ? AbortSignal.timeout(timeoutMs) : undefined;
 		const combinedSignal = combineAbortSignals([options?.signal, timeoutSignal]);
-		let response: Response;
+		let retryDelayMs: number | undefined;
 		try {
-			response = await fetch(resolveCodexCompactUrl(model.baseUrl), {
-				method: "POST",
-				headers,
-				body: JSON.stringify(body),
-				signal: combinedSignal.signal,
-			});
-		} catch (error) {
-			if (options?.signal?.aborted) throw new Error("Request was aborted");
-			const requestError =
-				timeoutSignal?.aborted && timeoutMs !== undefined
-					? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
-					: error;
-			if (attempt >= maxRetries) throw requestError;
-			await sleep(BASE_DELAY_MS * 2 ** attempt, options?.signal);
-			continue;
+			let response: Response;
+			try {
+				response = await fetch(resolveCodexCompactUrl(model.baseUrl), {
+					method: "POST",
+					headers,
+					body: JSON.stringify(body),
+					signal: combinedSignal.signal,
+				});
+			} catch (error) {
+				if (options?.signal?.aborted) throw new Error("Request was aborted");
+				const requestError =
+					timeoutSignal?.aborted && timeoutMs !== undefined
+						? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+						: error;
+				if (attempt >= maxRetries) throw requestError;
+				retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+				continue;
+			}
+
+			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			if (response.ok) {
+				try {
+					return (await response.json()) as CompactResponse;
+				} catch (error) {
+					if (options?.signal?.aborted) throw new Error("Request was aborted");
+					const responseError =
+						timeoutSignal?.aborted && timeoutMs !== undefined
+							? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+							: error;
+					if (attempt >= maxRetries) throw responseError;
+					retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+					continue;
+				}
+			}
+
+			let errorText: string;
+			try {
+				errorText = await response.text();
+			} catch (error) {
+				if (options?.signal?.aborted) throw new Error("Request was aborted");
+				const responseError =
+					timeoutSignal?.aborted && timeoutMs !== undefined
+						? new Error(`Codex compact response timed out after ${timeoutMs}ms`)
+						: error;
+				if (attempt >= maxRetries) throw responseError;
+				retryDelayMs = BASE_DELAY_MS * 2 ** attempt;
+				continue;
+			}
+			if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
+				const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
+				retryDelayMs =
+					retryAfterDelayMs === undefined
+						? BASE_DELAY_MS * 2 ** attempt
+						: response.status === 429
+							? capRetryDelayMs(retryAfterDelayMs, options)
+							: retryAfterDelayMs;
+				continue;
+			}
+
+			const info = await parseErrorResponse(
+				new Response(errorText, { status: response.status, statusText: response.statusText }),
+			);
+			throw new Error(info.friendlyMessage || info.message);
 		} finally {
 			combinedSignal.cleanup();
+			if (retryDelayMs !== undefined) await sleep(retryDelayMs, options?.signal);
 		}
-
-		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-		if (response.ok) return response;
-
-		const errorText = await response.text();
-		if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
-			const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
-			const delayMs =
-				retryAfterDelayMs === undefined
-					? BASE_DELAY_MS * 2 ** attempt
-					: response.status === 429
-						? capRetryDelayMs(retryAfterDelayMs, options)
-						: retryAfterDelayMs;
-			await sleep(delayMs, options?.signal);
-			continue;
-		}
-
-		const info = await parseErrorResponse(
-			new Response(errorText, { status: response.status, statusText: response.statusText }),
-		);
-		throw new Error(info.friendlyMessage || info.message);
 	}
 
 	throw new Error("Codex compact request failed after retries");
@@ -718,7 +744,7 @@ function getCompactedInput(model: Model<"openai-codex-responses">, context: Cont
 		state.provider !== model.provider ||
 		state.api !== model.api ||
 		state.model !== model.id ||
-		state.baseUrl !== normalizeCodexBaseUrl(model.baseUrl)
+		normalizeCodexBaseUrl(state.baseUrl) !== normalizeCodexBaseUrl(model.baseUrl)
 	) {
 		throw new Error("Codex compacted context is incompatible with the selected model");
 	}

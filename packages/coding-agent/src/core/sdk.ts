@@ -14,7 +14,7 @@ import { findInitialModel } from "./model-resolver.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
-import { getDefaultSessionDir, type ProviderStateTarget, SessionManager } from "./session-manager.ts";
+import { getDefaultSessionDir, getProviderStateTarget, SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
@@ -30,15 +30,6 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
-
-function getProviderStateTarget(model: Model<any>): ProviderStateTarget {
-	return {
-		provider: model.provider,
-		api: model.api,
-		model: model.id,
-		baseUrl: model.baseUrl.replace(/\/+$/, ""),
-	};
-}
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */

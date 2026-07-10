@@ -73,6 +73,16 @@ function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 	return () => callCount;
 }
 
+function createProviderState(model: Model<string>, encryptedContent: string): ProviderState {
+	return {
+		provider: model.provider,
+		api: model.api,
+		model: model.id,
+		baseUrl: model.baseUrl,
+		data: [{ type: "compaction", encrypted_content: encryptedContent }],
+	};
+}
+
 function seedCompactableSession(harness: Harness): void {
 	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
 	const now = Date.now();
@@ -153,13 +163,7 @@ describe("AgentSession compaction characterization", () => {
 		seedCompactableSession(harness);
 		const model = harness.getModel();
 		model.compaction = "native";
-		const state: ProviderState = {
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-			baseUrl: model.baseUrl,
-			data: [{ type: "compaction", encrypted_content: "opaque" }],
-		};
+		const state = createProviderState(model, "opaque");
 		const provider = getApiProvider(model.api);
 		if (!provider) throw new Error("Missing faux provider");
 		let compactCalls = 0;
@@ -216,16 +220,30 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("allows native compaction after switching away from an incompatible checkpoint", async () => {
-		const harness = await createHarness({
+		let harness: Harness;
+		let secondModel: Model<string>;
+		harness = await createHarness({
 			models: [
 				{ id: "model-a", contextWindow: 128_000, maxTokens: 16_384 },
 				{ id: "model-b", contextWindow: 128_000, maxTokens: 16_384 },
+			],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact", async (event) => {
+						if (
+							event.compactionEntry.type === "provider_checkpoint" &&
+							event.compactionEntry.state.model === "model-a"
+						) {
+							await harness.session.setModel(secondModel);
+						}
+					});
+				},
 			],
 		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const firstModel = harness.getModel("model-a")!;
-		const secondModel = harness.getModel("model-b")!;
+		secondModel = harness.getModel("model-b")!;
 		firstModel.compaction = "native";
 		secondModel.compaction = "native";
 		const provider = getApiProvider(firstModel.api);
@@ -249,9 +267,26 @@ describe("AgentSession compaction characterization", () => {
 		);
 
 		await harness.session.compact();
-		await harness.session.setModel(secondModel);
+		const restoredContext = await harness.session.agent.createLlmContext();
+		const firstModelContext = {
+			systemPrompt: restoredContext.systemPrompt ?? "",
+			messages: restoredContext.messages,
+			tools: harness.session.agent.state.tools,
+			providerState: createProviderState(firstModel, "model-a"),
+		};
+		const firstModelResponse = { ...createAssistant(harness, { stopReason: "stop" }), model: "model-a" };
+		expect(harness.session.model?.id).toBe("model-b");
 		expect(harness.session.agent.state.providerState).toBeUndefined();
 		expect(harness.session.messages).toHaveLength(2);
+
+		const nextTurn = await harness.session.agent.prepareNextTurnWithContext?.({
+			message: firstModelResponse,
+			toolResults: [],
+			context: firstModelContext,
+			newMessages: [],
+		});
+		expect(nextTurn?.context?.providerState).toBeUndefined();
+		expect(nextTurn?.context?.messages).toHaveLength(2);
 		await harness.session.compact();
 
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
@@ -301,13 +336,7 @@ describe("AgentSession compaction characterization", () => {
 		seedCompactableSession(harness);
 		const model = harness.getModel();
 		model.compaction = "native";
-		const state: ProviderState = {
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-			baseUrl: model.baseUrl,
-			data: [{ type: "compaction", encrypted_content: "threshold" }],
-		};
+		const state = createProviderState(model, "threshold");
 		const provider = getApiProvider(model.api);
 		if (!provider) throw new Error("Missing faux provider");
 		registerApiProvider(
@@ -328,27 +357,64 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.eventsOfType("compaction_end").at(-1)?.reason).toBe("threshold");
 	});
 
-	it("uses native compaction for overflow recovery without checkpointing the failed response", async () => {
+	it.each(["error", "length"] as const)(
+		"uses native compaction for %s overflow recovery without checkpointing the failed response",
+		async (stopReason) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const model = harness.getModel();
+			model.compaction = "native";
+			const overflow = createAssistant(harness, {
+				stopReason,
+				errorMessage: stopReason === "error" ? "maximum context length exceeded" : undefined,
+				totalTokens: model.contextWindow + 1,
+				timestamp: Date.now(),
+			});
+			harness.sessionManager.appendMessage(overflow);
+			harness.session.agent.state.messages = [...harness.session.agent.state.messages, overflow];
+			const state = createProviderState(model, "overflow");
+			const provider = getApiProvider(model.api);
+			if (!provider) throw new Error("Missing faux provider");
+			registerApiProvider(
+				{
+					api: model.api,
+					stream: provider.stream,
+					streamSimple: provider.streamSimple,
+					compactContext: async (_model, compactedContext) => {
+						expect(compactedContext.messages).toHaveLength(2);
+						return { state };
+					},
+				},
+				"native-compaction-test",
+			);
+
+			const recovered = await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(
+				overflow,
+			);
+
+			expect(recovered).toBe(true);
+			expect(harness.sessionManager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "message", message: overflow }),
+			);
+			const checkpoints = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "provider_checkpoint");
+			expect(checkpoints).toHaveLength(1);
+			expect(checkpoints[0]?.excludedEntryIds).toEqual([
+				harness.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message === overflow)
+					?.id,
+			]);
+			expect(harness.session.agent.state.providerState).toEqual(state);
+		},
+	);
+
+	it("rejects incompatible state without persisting a checkpoint", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const model = harness.getModel();
 		model.compaction = "native";
-		const overflow = createAssistant(harness, {
-			stopReason: "error",
-			errorMessage: "maximum context length exceeded",
-			totalTokens: model.contextWindow + 1,
-			timestamp: Date.now(),
-		});
-		harness.sessionManager.appendMessage(overflow);
-		harness.session.agent.state.messages = [...harness.session.agent.state.messages, overflow];
-		const state: ProviderState = {
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-			baseUrl: model.baseUrl,
-			data: [{ type: "compaction", encrypted_content: "overflow" }],
-		};
 		const provider = getApiProvider(model.api);
 		if (!provider) throw new Error("Missing faux provider");
 		registerApiProvider(
@@ -356,27 +422,15 @@ describe("AgentSession compaction characterization", () => {
 				api: model.api,
 				stream: provider.stream,
 				streamSimple: provider.streamSimple,
-				compactContext: async (_model, compactedContext) => {
-					expect(compactedContext.messages).toHaveLength(2);
-					return { state };
-				},
+				compactContext: async () => ({
+					state: { ...createProviderState(model, "opaque"), model: "different-model" },
+				}),
 			},
 			"native-compaction-test",
 		);
 
-		const recovered = await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(overflow);
-
-		expect(recovered).toBe(true);
-		expect(harness.sessionManager.getEntries()).toContainEqual(
-			expect.objectContaining({ type: "message", message: overflow }),
-		);
-		const checkpoints = harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint");
-		expect(checkpoints).toHaveLength(1);
-		expect(checkpoints[0]?.excludedEntryIds).toEqual([
-			harness.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message === overflow)
-				?.id,
-		]);
-		expect(harness.session.agent.state.providerState).toEqual(state);
+		await expect(harness.session.compact()).rejects.toThrow("different provider, API, model, or base URL");
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "provider_checkpoint")).toBe(false);
 	});
 
 	it("does not fall back to summary compaction when native compaction fails", async () => {

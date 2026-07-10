@@ -1,5 +1,5 @@
 import { type AgentMessage, uuidv7 } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, ProviderState, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, Model, ProviderState, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -176,6 +176,20 @@ export interface ProviderStateTarget {
 	api: string;
 	model: string;
 	baseUrl: string;
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+	return baseUrl.replace(/\/+$/, "");
+}
+
+export function getProviderStateTarget(model: Model<any> | undefined): ProviderStateTarget | undefined {
+	if (!model) return undefined;
+	return {
+		provider: model.provider,
+		api: model.api,
+		model: model.id,
+		baseUrl: normalizeBaseUrl(model.baseUrl),
+	};
 }
 
 export interface SessionContext {
@@ -450,13 +464,13 @@ export function buildContextEntries(
 	return buildContextProjection(entries, leafId, byId, target).entries;
 }
 
-function isProviderStateCompatible(state: ProviderState, target: ProviderStateTarget | undefined): boolean {
+export function isProviderStateCompatible(state: ProviderState, target: ProviderStateTarget | undefined): boolean {
 	return (
 		target !== undefined &&
 		state.provider === target.provider &&
 		state.api === target.api &&
 		state.model === target.model &&
-		state.baseUrl === target.baseUrl
+		normalizeBaseUrl(state.baseUrl) === normalizeBaseUrl(target.baseUrl)
 	);
 }
 

@@ -185,7 +185,7 @@ export interface StreamOptions {
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
-export type ContextCompactionOptions = StreamOptions & Record<string, unknown>;
+export type ContextCompactionOptions = SimpleStreamOptions & Record<string, unknown>;
 
 export interface ProviderState<T = unknown> {
 	provider: ProviderId;
@@ -226,9 +226,9 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 	: StreamOptions & Record<string, unknown>;
 
 /**
- * The uniform stream contract of an API implementation module: every module
- * under `src/api/` exports exactly `stream` and `streamSimple`, so the module
- * itself satisfies this interface. Lazy wrappers (`lazyApi()`) and provider
+ * The uniform stream contract of an API implementation module. Modules export
+ * `stream` and `streamSimple`; providers with one-shot context compaction may
+ * also export `compactContext`. Lazy wrappers (`lazyApi()`) and provider
  * factories pass these around as values. This is the untyped dispatch shape;
  * per-API option typing lives on the implementation modules themselves and on
  * `Provider.stream()` via `ApiStreamOptions`.

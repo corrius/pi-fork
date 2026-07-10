@@ -89,7 +89,7 @@ import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-nam
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
-	type ProviderStateTarget,
+	getProviderStateTarget,
 	type SessionEntry,
 	SessionManager,
 	sessionEntryToContextMessages,
@@ -201,16 +201,6 @@ type CompactionQueuedMessage = {
 };
 
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" | "provider_checkpoint" }>;
-
-function getProviderStateTarget(model: Model<any> | undefined): ProviderStateTarget | undefined {
-	if (!model) return undefined;
-	return {
-		provider: model.provider,
-		api: model.api,
-		model: model.id,
-		baseUrl: model.baseUrl.replace(/\/+$/, ""),
-	};
-}
 
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";

@@ -129,6 +129,18 @@ function wrapStreamSimple<TApi extends Api>(
 	};
 }
 
+function wrapCompactContext<TApi extends Api>(
+	api: TApi,
+	compactContext: NonNullable<ApiProvider<TApi>["compactContext"]>,
+): NonNullable<ApiProviderInternal["compactContext"]> {
+	return (model, context, options) => {
+		if (model.api !== api) {
+			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
+		}
+		return compactContext(model as Model<TApi>, context, options);
+	};
+}
+
 export function registerApiProvider<TApi extends Api, TOptions extends StreamOptions>(
 	provider: ApiProvider<TApi, TOptions>,
 	sourceId?: string,
@@ -139,16 +151,7 @@ export function registerApiProvider<TApi extends Api, TOptions extends StreamOpt
 			stream: wrapStream(provider.api, provider.stream),
 			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
 			compactContext: provider.compactContext
-				? (model, context, options) => {
-						if (model.api !== provider.api) {
-							throw new Error(`Mismatched api: ${model.api} expected ${provider.api}`);
-						}
-						return provider.compactContext?.(
-							model as Model<TApi>,
-							context,
-							options,
-						) as Promise<ContextCompactionResult>;
-					}
+				? wrapCompactContext(provider.api, provider.compactContext)
 				: undefined,
 		},
 		sourceId,

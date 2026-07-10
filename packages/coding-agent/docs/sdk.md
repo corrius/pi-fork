@@ -104,7 +104,7 @@ interface AgentSession {
   navigateTree(targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }): Promise<{ editorText?: string; cancelled: boolean }>;
 
   // Compaction
-  compact(customInstructions?: string): Promise<CompactionResult>;
+  compact(customInstructions?: string): Promise<SessionCompactionResult>;
   abortCompaction(): void;
 
   // Abort current operation
@@ -114,6 +114,8 @@ interface AgentSession {
   dispose(): void;
 }
 ```
+
+`SessionCompactionResult` is a summary-shaped `CompactionResult` by default or a `ProviderCompactionResult` when the selected model uses native compaction. Native compaction does not accept custom instructions.
 
 Session replacement APIs such as new-session, resume, fork, and import live on `AgentSessionRuntime`, not on `AgentSession`.
 

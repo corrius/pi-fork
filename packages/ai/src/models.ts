@@ -308,7 +308,7 @@ class ModelsImpl implements MutableModels {
 	): Promise<ContextCompactionResult> {
 		const provider = this.requireProvider(model);
 		if (!provider.compactContext) {
-			throw new ModelsError("stream", `Provider ${provider.id} does not support native context compaction`);
+			throw new ModelsError("compaction", `Provider ${provider.id} does not support native context compaction`);
 		}
 		const { requestModel, requestOptions } = await this.applyAuth(model, options);
 		return provider.compactContext(requestModel, context, requestOptions);
@@ -401,7 +401,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 					const streams = apiFor(model);
 					if (!streams?.compactContext) {
 						throw new ModelsError(
-							"stream",
+							"compaction",
 							`Provider ${input.id} has no context compaction implementation for "${model.api}"`,
 						);
 					}

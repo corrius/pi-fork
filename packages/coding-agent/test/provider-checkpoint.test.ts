@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProviderState } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
@@ -6,6 +9,7 @@ import {
 	type ProviderCheckpointEntry,
 	type ProviderStateTarget,
 	type SessionEntry,
+	SessionManager,
 } from "../src/core/session-manager.ts";
 
 const state: ProviderState = {
@@ -58,6 +62,15 @@ describe("provider checkpoint projection", () => {
 		expect(context.messages.map((entry) => ("content" in entry ? entry.content : undefined))).toEqual(["after"]);
 	});
 
+	it("normalizes trailing slashes when checking compatibility", () => {
+		const context = buildSessionContext(entries, "after", undefined, {
+			...target,
+			baseUrl: `${target.baseUrl}/`,
+		});
+		expect(context.providerState).toEqual(state);
+		expect(context.messages.map((entry) => ("content" in entry ? entry.content : undefined))).toEqual(["after"]);
+	});
+
 	it("reconstructs the untouched raw history for an incompatible model", () => {
 		const incompatibleTarget = { ...target, model: "gpt-5.6-sol-mini" };
 		const context = buildSessionContext(entries, "after", undefined, incompatibleTarget);
@@ -78,6 +91,41 @@ describe("provider checkpoint projection", () => {
 			"before one",
 			"before two",
 		]);
+	});
+
+	it("persists and restores opaque state from JSONL", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-provider-checkpoint-"));
+		try {
+			const manager = SessionManager.create(tempDir, tempDir);
+			manager.appendMessage({ role: "user", content: "before", timestamp: 1 });
+			manager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "before reply" }],
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			});
+			manager.appendProviderCheckpoint(state, 100);
+			manager.appendMessage({ role: "user", content: "after", timestamp: 2 });
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected persisted session file");
+
+			const restored = SessionManager.open(sessionFile, tempDir).buildSessionContext(target);
+			expect(restored.providerState).toEqual(state);
+			expect(restored.messages.map((entry) => ("content" in entry ? entry.content : undefined))).toEqual(["after"]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("does not restore an overflow response excluded from the checkpoint input", () => {

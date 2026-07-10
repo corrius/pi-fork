@@ -87,7 +87,7 @@ describe("openai-codex native compaction", () => {
 			model,
 			{
 				systemPrompt: "Base instructions",
-				providerState: compacted.state,
+				providerState: { ...compacted.state, baseUrl: `${compacted.state.baseUrl}/` },
 				messages: [{ role: "user", content: "After compaction", timestamp: 2 }],
 			},
 			{ apiKey: token, transport: "sse" },
@@ -114,6 +114,25 @@ describe("openai-codex native compaction", () => {
 
 		await expect(request).resolves.toMatchObject({ state: { data: [{ type: "compaction_summary" }] } });
 		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it.each([200, 503])("keeps the timeout active while reading a %i response body", async (status) => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_input: string | URL, init?: RequestInit) => {
+				const signal = init?.signal;
+				const body = new ReadableStream({
+					start(controller) {
+						signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+					},
+				});
+				return new Response(body, { status });
+			}),
+		);
+
+		await expect(
+			compactContext(model, context, { apiKey: mockToken(), timeoutMs: 10, maxRetries: 0 }),
+		).rejects.toThrow("timed out after 10ms");
 	});
 
 	it("preserves abort error identity", async () => {

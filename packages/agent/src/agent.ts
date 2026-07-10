@@ -9,7 +9,7 @@ import {
 	type ThinkingBudgets,
 	type Transport,
 } from "@earendil-works/pi-ai/compat";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { createLlmContext, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -256,14 +256,7 @@ export class Agent {
 
 	/** Build the exact provider context used for the next model request. */
 	async createLlmContext(signal?: AbortSignal): Promise<Context> {
-		let messages = this._state.messages;
-		if (this.transformContext) messages = await this.transformContext(messages, signal);
-		return {
-			systemPrompt: this._state.systemPrompt,
-			messages: await this.convertToLlm(messages),
-			tools: this._state.tools,
-			providerState: this._state.providerState,
-		};
+		return createLlmContext(this.createContextSnapshot(), this.createLoopConfig(), signal);
 	}
 
 	/** Controls how queued steering messages are drained. */
