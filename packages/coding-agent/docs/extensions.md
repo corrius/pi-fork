@@ -455,16 +455,17 @@ Fired on compaction. See [compaction.md](compaction.md) for details.
 
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
-  const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
+  const { preparation, branchEntries, customInstructions, reason, willRetry, mode, signal } = event;
 
   // reason - "manual" (/compact), "threshold", or "overflow"
   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+  // mode - "summary" or "native"
 
   // Cancel:
   return { cancel: true };
 
-  // Custom summary:
-  return {
+  // Custom summary (summary mode only):
+  if (mode === "summary") return {
     compaction: {
       summary: "...",
       firstKeptEntryId: preparation.firstKeptEntryId,
@@ -475,7 +476,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 });
 
 pi.on("session_compact", async (event, ctx) => {
-  // event.compactionEntry - the saved compaction
+  // event.compactionEntry - CompactionEntry or ProviderCheckpointEntry
   // event.fromExtension - whether extension provided it
   // event.reason - "manual" (/compact), "threshold", or "overflow"
   // event.willRetry - whether the aborted turn is retried after compaction (overflow recovery)
@@ -489,6 +490,8 @@ pi.on("session_compact_failed", async (event, ctx) => {
   // event.fromExtension - whether extension-provided compaction content was being used
 });
 ```
+
+Native mode supports cancellation and observation, but returning a custom summary is an error. Its saved `ProviderCheckpointEntry` contains opaque provider state rather than summary text.
 
 #### session_before_tree / session_tree
 

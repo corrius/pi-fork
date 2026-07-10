@@ -1,5 +1,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import {
+	type ImageContent,
+	type Message,
+	type Model,
+	type ProviderState,
+	type TextContent,
+	type Usage,
+	uuidv7,
+} from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -79,6 +87,15 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 }
 
+export interface ProviderCheckpointEntry extends SessionEntryBase {
+	type: "provider_checkpoint";
+	state: ProviderState;
+	tokensBefore: number;
+	usage?: Usage;
+	/** Persisted responses that were deliberately excluded from the compact request, such as overflow errors. */
+	excludedEntryIds?: string[];
+}
+
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	type: "branch_summary";
 	fromId: string;
@@ -146,6 +163,7 @@ export type SessionEntry =
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
 	| CompactionEntry
+	| ProviderCheckpointEntry
 	| BranchSummaryEntry
 	| CustomEntry
 	| CustomMessageEntry
@@ -165,10 +183,32 @@ export interface SessionTreeNode {
 	labelTimestamp?: string;
 }
 
+export interface ProviderStateTarget {
+	provider: string;
+	api: string;
+	model: string;
+	baseUrl: string;
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+	return baseUrl.replace(/\/+$/, "");
+}
+
+export function getProviderStateTarget(model: Model<any> | undefined): ProviderStateTarget | undefined {
+	if (!model) return undefined;
+	return {
+		provider: model.provider,
+		api: model.api,
+		model: model.id,
+		baseUrl: normalizeBaseUrl(model.baseUrl),
+	};
+}
+
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
 	model: { provider: string; modelId: string } | null;
+	providerState?: ProviderState;
 }
 
 export interface SessionInfo {
@@ -322,6 +362,18 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+export function getLatestCompactionBoundary(
+	entries: SessionEntry[],
+	target?: ProviderStateTarget,
+): CompactionEntry | ProviderCheckpointEntry | null {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type === "compaction") return entry;
+		if (entry.type === "provider_checkpoint" && isProviderStateCompatible(entry.state, target)) return entry;
+	}
+	return null;
+}
+
 function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntry>): Map<string, SessionEntry> {
 	if (byId) return byId;
 	const index = new Map<string, SessionEntry>();
@@ -419,38 +471,61 @@ export function buildContextEntries(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	target?: ProviderStateTarget,
 ): SessionEntry[] {
+	return buildContextProjection(entries, leafId, byId, target).entries;
+}
+
+export function isProviderStateCompatible(state: ProviderState, target: ProviderStateTarget | undefined): boolean {
+	return (
+		target !== undefined &&
+		state.provider === target.provider &&
+		state.api === target.api &&
+		state.model === target.model &&
+		normalizeBaseUrl(state.baseUrl) === normalizeBaseUrl(target.baseUrl)
+	);
+}
+
+function buildContextProjection(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+	target?: ProviderStateTarget,
+): { entries: SessionEntry[]; providerState?: ProviderState } {
 	const path = buildSessionPath(entries, leafId, byId);
-	let compaction: CompactionEntry | null = null;
+	const excludedEntryIds = new Set(
+		path.flatMap((entry) => (entry.type === "provider_checkpoint" ? (entry.excludedEntryIds ?? []) : [])),
+	);
+	const contextPath = path.filter((entry) => !excludedEntryIds.has(entry.id));
+	let boundary: CompactionEntry | ProviderCheckpointEntry | undefined;
 
-	for (const entry of path) {
-		if (entry.type === "compaction") {
-			compaction = entry;
+	for (const entry of contextPath) {
+		if (
+			entry.type === "compaction" ||
+			(entry.type === "provider_checkpoint" && isProviderStateCompatible(entry.state, target))
+		) {
+			boundary = entry;
 		}
 	}
+	if (!boundary) return { entries: contextPath };
 
-	if (!compaction) {
-		return path;
+	const boundaryIndex = contextPath.findIndex((entry) => entry.id === boundary.id);
+	if (boundary.type === "provider_checkpoint") {
+		return {
+			entries: [boundary, ...contextPath.slice(boundaryIndex + 1)],
+			providerState: boundary.state,
+		};
 	}
 
-	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
-	if (compactionIdx < 0) {
-		return path;
-	}
-
-	const contextEntries: SessionEntry[] = [compaction];
+	const contextEntries: SessionEntry[] = [boundary];
 	let foundFirstKept = false;
-	for (let i = 0; i < compactionIdx; i++) {
-		const entry = path[i];
-		if (entry.id === compaction.firstKeptEntryId) {
-			foundFirstKept = true;
-		}
-		if (foundFirstKept) {
-			contextEntries.push(entry);
-		}
+	for (let i = 0; i < boundaryIndex; i++) {
+		const entry = contextPath[i];
+		if (entry.id === boundary.firstKeptEntryId) foundFirstKept = true;
+		if (foundFirstKept) contextEntries.push(entry);
 	}
-	contextEntries.push(...path.slice(compactionIdx + 1));
-	return contextEntries;
+	contextEntries.push(...contextPath.slice(boundaryIndex + 1));
+	return { entries: contextEntries };
 }
 
 /**
@@ -462,11 +537,13 @@ export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	target?: ProviderStateTarget,
 ): SessionContext {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
-	return { messages, thinkingLevel, model };
+	const projection = buildContextProjection(entries, leafId, byId, target);
+	const messages = projection.entries.flatMap(sessionEntryToContextMessages);
+	return { messages, thinkingLevel, model, providerState: projection.providerState };
 }
 
 /**
@@ -1132,6 +1209,27 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a provider-owned compacted checkpoint as child of current leaf. */
+	appendProviderCheckpoint(
+		state: ProviderState,
+		tokensBefore: number,
+		usage?: Usage,
+		excludedEntryIds?: string[],
+	): string {
+		const entry: ProviderCheckpointEntry = {
+			type: "provider_checkpoint",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			state,
+			tokensBefore,
+			usage,
+			excludedEntryIds,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = {
@@ -1287,16 +1385,16 @@ export class SessionManager {
 	 * Build the active, compaction-aware entry list for context/rendering.
 	 * Uses tree traversal from current leaf.
 	 */
-	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+	buildContextEntries(target?: ProviderStateTarget): SessionEntry[] {
+		return buildContextEntries(this.getEntries(), this.leafId, this.byId, target);
 	}
 
 	/**
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
-	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+	buildSessionContext(target?: ProviderStateTarget): SessionContext {
+		return buildSessionContext(this.getEntries(), this.leafId, this.byId, target);
 	}
 
 	/**

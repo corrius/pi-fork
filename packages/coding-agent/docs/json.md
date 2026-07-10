@@ -28,7 +28,7 @@ type JsonAgentSessionEvent =
     };
 ```
 
-`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction.
+`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction. `SessionCompactionResult` is a text-summary `CompactionResult` or a native `ProviderCompactionResult` with `type: "provider_checkpoint"` and opaque provider state.
 
 Other base events come from
 [`AgentEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/types.ts):

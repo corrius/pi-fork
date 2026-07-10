@@ -141,6 +141,7 @@ describe("Documentation example", () => {
 				const fromExtension = event.fromExtension;
 
 				expect(entry.type).toBe("compaction");
+				if (entry.type !== "compaction") throw new Error("Expected summary compaction entry");
 				expect(typeof entry.summary).toBe("string");
 				expect(typeof entry.tokensBefore).toBe("number");
 				expect(typeof fromExtension).toBe("boolean");

@@ -295,6 +295,38 @@ describe("TreeSelectorComponent", () => {
 		});
 	});
 
+	describe("provider checkpoints", () => {
+		test("renders native compaction metadata", () => {
+			const entries: SessionEntry[] = [
+				userMessage("user-1", null, "hello"),
+				{
+					type: "provider_checkpoint",
+					id: "checkpoint-1",
+					parentId: "user-1",
+					timestamp: new Date().toISOString(),
+					tokensBefore: 42_000,
+					state: {
+						provider: "openai-codex",
+						api: "openai-codex-responses",
+						model: "gpt-5.6-sol",
+						baseUrl: "https://chatgpt.com/backend-api",
+						data: [],
+					},
+				},
+			];
+			const selector = new TreeSelectorComponent(
+				buildTree(entries),
+				"checkpoint-1",
+				24,
+				() => {},
+				() => {},
+			);
+
+			const rendered = selector.getTreeList().render(200).map(stripVTControlCharacters).join("\n");
+			expect(rendered).toContain("native compaction: openai-codex/gpt-5.6-sol, 42k tokens");
+		});
+	});
+
 	describe("label timestamps", () => {
 		test("toggles label timestamps for labeled nodes", () => {
 			const entries = [userMessage("user-1", null, "hello"), assistantMessage("asst-1", "user-1", "hi")];

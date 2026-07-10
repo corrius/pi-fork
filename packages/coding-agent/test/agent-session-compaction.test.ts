@@ -94,6 +94,8 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		// Manually compact
 		const result = await session.compact();
 
+		expect("type" in result).toBe(false);
+		if ("type" in result) throw new Error("Expected summary compaction");
 		expect(result.summary).toBeDefined();
 		expect(result.summary.length).toBeGreaterThan(0);
 		expect(result.tokensBefore).toBeGreaterThan(0);
@@ -173,6 +175,8 @@ describe.skipIf(!API_KEY)("AgentSession compaction e2e", () => {
 		// Compact should work even without file persistence
 		const result = await session.compact();
 
+		expect("type" in result).toBe(false);
+		if ("type" in result) throw new Error("Expected summary compaction");
 		expect(result.summary).toBeDefined();
 		expect(result.summary.length).toBeGreaterThan(0);
 

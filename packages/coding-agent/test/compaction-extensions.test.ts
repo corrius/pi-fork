@@ -152,6 +152,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const afterEvent = compactEvents[0];
 		expect(afterEvent.compactionEntry).toBeDefined();
+		if (afterEvent.compactionEntry.type !== "compaction") throw new Error("Expected summary compaction entry");
 		expect(afterEvent.compactionEntry.summary.length).toBeGreaterThan(0);
 		expect(afterEvent.compactionEntry.tokensBefore).toBeGreaterThanOrEqual(0);
 		expect(afterEvent.fromExtension).toBe(false);
@@ -202,6 +203,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const afterEvent = compactEvents[0];
 		if (afterEvent.type === "session_compact") {
+			if (afterEvent.compactionEntry.type !== "compaction") throw new Error("Expected summary compaction entry");
 			expect(afterEvent.compactionEntry.summary).toBe(customSummary);
 			expect(afterEvent.fromExtension).toBe(true);
 		}
@@ -267,6 +269,8 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const result = await session.compact();
 
+		expect("type" in result).toBe(false);
+		if ("type" in result) throw new Error("Expected summary compaction");
 		expect(result.summary).toBeDefined();
 		expect(result.summary.length).toBeGreaterThan(0);
 
