@@ -128,6 +128,10 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} • ${sessionName}`;
 		}
 
+		const compactionCount = this.session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "compaction" || entry.type === "provider_checkpoint").length;
+
 		// Build stats line
 		const statsParts = [];
 		if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
@@ -137,6 +141,7 @@ export class FooterComponent implements Component {
 		if ((totalCacheRead > 0 || totalCacheWrite > 0) && latestCacheHitRate !== undefined) {
 			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
 		}
+		if (compactionCount > 0) statsParts.push(`↻${compactionCount}`);
 		// Show cost with "(sub)" indicator if using OAuth subscription
 		const usingSubscription = state.model ? this.session.modelRuntime.isUsingOAuth(state.model.provider) : false;
 		if (totalCost || usingSubscription) {

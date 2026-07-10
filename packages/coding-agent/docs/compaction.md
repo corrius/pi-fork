@@ -78,7 +78,7 @@ What the LLM sees:
 
 ### Native Provider Compaction
 
-Models configured with `"compaction": "native"` use a provider-owned compaction operation for manual `/compact` requests. Automatic threshold and overflow compaction remain disabled for native models. The first implementation supports ChatGPT OAuth models using `openai-codex-responses` and calls `/backend-api/codex/responses/compact`.
+Models configured with `"compaction": "native"` use a provider-owned compaction operation for the same manual, threshold, and overflow triggers. The first implementation supports ChatGPT OAuth models using `openai-codex-responses` and calls `/backend-api/codex/responses/compact`.
 
 The returned output is stored unchanged in a `ProviderCheckpointEntry`. While the provider, API, model, and base URL remain compatible, the request context consists of that opaque output followed by messages appended after the checkpoint. Earlier entries stay in the append-only session tree but are not sent. Switching to an incompatible model ignores the checkpoint and reconstructs context from the original entries.
 

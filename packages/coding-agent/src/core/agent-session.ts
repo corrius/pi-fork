@@ -107,7 +107,6 @@ import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager 
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionBoundary,
-	getLatestCompactionEntry,
 	getProviderStateTarget,
 	isProviderStateCompatible,
 	type SessionHeader,
@@ -2074,7 +2073,7 @@ export class AgentSession {
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
-		if (!settings.enabled || this.model?.compaction === "native") return false;
+		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
@@ -2091,7 +2090,10 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionBoundary(
+			this.sessionManager.getBranch(),
+			getProviderStateTarget(this.model),
+		);
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
@@ -2123,13 +2125,18 @@ export class AgentSession {
 			}
 
 			this._overflowRecoveryAttempted = true;
-			// Remove the error message from agent state (it IS saved to session for history,
+			// Remove the overflow response from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			const overflowEntry = this.sessionManager.getLeafEntry();
+			const excludedEntryIds =
+				overflowEntry?.type === "message" && overflowEntry.message === assistantMessage
+					? [overflowEntry.id]
+					: undefined;
+			return await this._runAutoCompaction("overflow", willRetry, excludedEntryIds);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -2166,7 +2173,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		excludedEntryIds?: string[],
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2175,30 +2186,14 @@ export class AgentSession {
 				return false;
 			}
 
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFn === streamSimple) {
-				const authResult = await this._modelRuntime.getAuth(this.model);
-				if (!authResult?.auth.apiKey) return false;
-				apiKey = authResult.auth.apiKey;
-				headers = withoutDeletedHeaders(authResult.auth.headers);
-				env = authResult.env;
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
-			}
-
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
+			const native = this.model.compaction === "native";
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) return false;
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
-
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
@@ -2210,7 +2205,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
-					mode: "summary",
+					mode: native ? "native" : "summary",
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
@@ -2229,6 +2224,42 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const result = await this._compactProviderContext(
+					reason,
+					willRetry,
+					this._autoCompactionAbortController.signal,
+					excludedEntryIds,
+				);
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				return willRetry || this.agent.hasQueuedMessages();
+			}
+
+			let apiKey: string | undefined;
+			let headers: Record<string, string> | undefined;
+			let env: Record<string, string> | undefined;
+			if (this.agent.streamFn === streamSimple) {
+				const authResult = await this._modelRuntime.getAuth(this.model);
+				if (!authResult?.auth.apiKey) {
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: true,
+						willRetry: false,
+					});
+					return false;
+				}
+				apiKey = authResult.auth.apiKey;
+				headers = withoutDeletedHeaders(authResult.auth.headers);
+				env = authResult.env;
+			} else {
+				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
 			}
 
 			let summary: string;
@@ -2274,8 +2305,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event

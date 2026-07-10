@@ -330,6 +330,85 @@ describe("AgentSession compaction characterization", () => {
 		expect(providerCalls).toBe(0);
 	});
 
+	it("uses native compaction for threshold-triggered compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "threshold");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => ({ state }),
+			},
+			"native-compaction-test",
+		);
+
+		await (harness.session as unknown as SessionWithCompactionInternals)._runAutoCompaction("threshold", false);
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
+			1,
+		);
+		expect(harness.eventsOfType("compaction_end").at(-1)?.reason).toBe("threshold");
+	});
+
+	it.each(["error", "length"] as const)(
+		"uses native compaction for %s overflow recovery without checkpointing the failed response",
+		async (stopReason) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const model = harness.getModel();
+			model.compaction = "native";
+			const overflow = createAssistant(harness, {
+				stopReason,
+				errorMessage: stopReason === "error" ? "maximum context length exceeded" : undefined,
+				totalTokens: model.contextWindow + 1,
+				timestamp: Date.now(),
+			});
+			harness.sessionManager.appendMessage(overflow);
+			harness.session.agent.state.messages = [...harness.session.agent.state.messages, overflow];
+			const state = createProviderState(model, "overflow");
+			const provider = getApiProvider(model.api);
+			if (!provider) throw new Error("Missing faux provider");
+			registerApiProvider(
+				{
+					api: model.api,
+					stream: provider.stream,
+					streamSimple: provider.streamSimple,
+					compactContext: async (_model, compactedContext) => {
+						expect(compactedContext.messages).toHaveLength(2);
+						return { state };
+					},
+				},
+				"native-compaction-test",
+			);
+
+			const recovered = await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(
+				overflow,
+			);
+
+			expect(recovered).toBe(true);
+			expect(harness.sessionManager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "message", message: overflow }),
+			);
+			const checkpoints = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "provider_checkpoint");
+			expect(checkpoints).toHaveLength(1);
+			expect(checkpoints[0]?.excludedEntryIds).toEqual([
+				harness.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message === overflow)
+					?.id,
+			]);
+			expect(harness.session.agent.state.providerState).toEqual(state);
+		},
+	);
+
 	it("rejects incompatible state without persisting a checkpoint", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
