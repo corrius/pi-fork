@@ -1,0 +1,97 @@
+name: Validate Pi native stack
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Official Pi version to validate (defaults to latest npm version)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-native-stack-validation
+  cancel-in-progress: false
+
+env:
+  STACK_BRANCH: feat/ac/openai-codex-compaction-stack
+  FORK_URL: https://github.com/corrius/pi-fork.git
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Resolve official version and stack revision
+        id: combination
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${REQUESTED_VERSION:-}"
+          if [[ -z "$version" ]]; then
+            version=$(npm view @earendil-works/pi-coding-agent version)
+          fi
+          stack_revision=$(git ls-remote "$FORK_URL" "refs/heads/$STACK_BRANCH" | awk '{print $1}')
+          if [[ -z "$stack_revision" ]]; then
+            echo "Could not resolve $STACK_BRANCH" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "stack_revision=$stack_revision" >> "$GITHUB_OUTPUT"
+          echo "cache_key=pi-native-$version-$stack_revision" >> "$GITHUB_OUTPUT"
+
+      - name: Restore validation marker
+        id: validation-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/pi-native-validation
+          key: ${{ steps.combination.outputs.cache_key }}
+
+      - name: Install system dependencies
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Validate stack against official release
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        run: ./scripts/pi-native/validate-stack.sh --version "${{ steps.combination.outputs.version }}"
+
+      - name: Create validation marker
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .cache/pi-native-validation
+          printf '%s\n' "${{ steps.combination.outputs.cache_key }}" > .cache/pi-native-validation/validated
+
+      - name: Save validation marker
+        if: steps.validation-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/pi-native-validation
+          key: ${{ steps.combination.outputs.cache_key }}
+
+      - name: Report result
+        run: |
+          {
+            echo "### Pi native stack"
+            echo
+            echo "- Official version: \`${{ steps.combination.outputs.version }}\`"
+            echo "- Stack revision: \`${{ steps.combination.outputs.stack_revision }}\`"
+            echo "- Cached result: \`${{ steps.validation-cache.outputs.cache-hit == 'true' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
