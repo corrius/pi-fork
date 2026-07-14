@@ -56,4 +56,45 @@ describe("InteractiveMode compaction events", () => {
 		);
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
+
+	test("rebuilds the transcript without applying a provider checkpoint boundary", () => {
+		const entries = [{ type: "provider_checkpoint" }];
+		const fakeThis = {
+			chatContainer: { clear: vi.fn() },
+			sessionManager: { buildContextEntries: vi.fn(() => entries) },
+			renderSessionEntries: vi.fn(),
+		};
+		const rebuildChatFromMessages = Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages") as (
+			this: typeof fakeThis,
+		) => void;
+
+		rebuildChatFromMessages.call(fakeThis);
+
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledWith();
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(entries);
+	});
+
+	test("restores the full transcript without applying a provider checkpoint boundary", () => {
+		const entries = [{ type: "provider_checkpoint" }];
+		const fakeThis = {
+			sessionManager: {
+				buildContextEntries: vi.fn(() => entries),
+				getEntries: vi.fn(() => []),
+			},
+			renderSessionEntries: vi.fn(),
+			renderProjectTrustWarningIfNeeded: vi.fn(),
+			showStatus: vi.fn(),
+		};
+		const renderInitialMessages = Reflect.get(InteractiveMode.prototype, "renderInitialMessages") as (
+			this: typeof fakeThis,
+		) => void;
+
+		renderInitialMessages.call(fakeThis);
+
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledWith();
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(entries, {
+			updateFooter: true,
+			populateHistory: true,
+		});
+	});
 });
