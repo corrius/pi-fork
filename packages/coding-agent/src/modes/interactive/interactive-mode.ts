@@ -91,12 +91,7 @@ import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
-import {
-	getProviderStateTarget,
-	type SessionEntry,
-	SessionManager,
-	sessionEntryToContextMessages,
-} from "../../core/session-manager.ts";
+import { type SessionEntry, SessionManager, sessionEntryToContextMessages } from "../../core/session-manager.ts";
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
@@ -3894,7 +3889,7 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.buildContextEntries(getProviderStateTarget(this.session.model));
+		const entries = this.sessionManager.buildContextEntries();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -3948,7 +3943,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries(getProviderStateTarget(this.session.model)));
+		this.renderSessionEntries(this.sessionManager.buildContextEntries());
 	}
 
 	// =========================================================================
