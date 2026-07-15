@@ -99,7 +99,7 @@ git -C "$staging" cherry-pick "${commits[@]}"
 
 (
   cd "$staging"
-  npm install
+  npm ci --ignore-scripts
   npm run check
   git diff --exit-code
   npm run build
