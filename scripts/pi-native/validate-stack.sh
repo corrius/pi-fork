@@ -4,7 +4,7 @@ set -Eeuo pipefail
 UPSTREAM_URL="${PI_NATIVE_UPSTREAM_URL:-https://github.com/earendil-works/pi-mono.git}"
 FORK_URL="${PI_NATIVE_FORK_URL:-https://github.com/corrius/pi-fork.git}"
 STACK_BRANCH="${PI_NATIVE_STACK_BRANCH:-feat/ac/openai-codex-compaction-stack}"
-STACK_BASE="${PI_NATIVE_STACK_BASE:-bc469b03389135edf5d179ab7718c2085cdfd3a9}"
+STACK_BASE="${PI_NATIVE_STACK_BASE:-818d67457cdd6b60bce6b121d16b23141c252dd8}"
 PACKAGE="@earendil-works/pi-coding-agent"
 VERSION=""
 STACK_REVISION=""
