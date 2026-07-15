@@ -7,8 +7,9 @@ It does not rebase, force-push, install Pi, or modify the stack branch.
 ```bash
 ./scripts/pi-native/validate-stack.sh
 ./scripts/pi-native/validate-stack.sh --version 0.80.6
+./scripts/pi-native/validate-stack.sh --version 0.80.6 --stack-revision 46238b6fac6b889d9ebf2537b4b3c6140fa97499
 ```
 
-The latest `@earendil-works/pi-coding-agent` npm version is used when `--version` is omitted. URLs, branch, and base commit can be overridden with the environment variables shown by `--help`.
+The latest `@earendil-works/pi-coding-agent` npm version is used when `--version` is omitted. Passing `--stack-revision` pins validation to the exact remote branch revision and fails if the branch moves before it is fetched. URLs, branch, and base commit can be overridden with the environment variables shown by `--help`.
 
-The `pi-native-stack.yml` workflow polls npm and the remote stack hourly, and it can also be run manually for a specific version. Successful `official version + stack revision` combinations are cached, so unchanged scheduled runs finish without rebuilding.
+The `pi-native-stack.yml` workflow polls npm and the remote stack hourly, and it can also be run manually for a specific version. Successful `official version + stack revision + validator revision` combinations are cached, so unchanged scheduled runs finish without rebuilding.

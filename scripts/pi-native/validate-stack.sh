@@ -7,10 +7,11 @@ STACK_BRANCH="${PI_NATIVE_STACK_BRANCH:-feat/ac/openai-codex-compaction-stack}"
 STACK_BASE="${PI_NATIVE_STACK_BASE:-bc469b03389135edf5d179ab7718c2085cdfd3a9}"
 PACKAGE="@earendil-works/pi-coding-agent"
 VERSION=""
+STACK_REVISION=""
 
 usage() {
   cat <<'EOF'
-Usage: validate-stack.sh [--version <version>]
+Usage: validate-stack.sh [--version <version>] [--stack-revision <commit>]
 
 Replay the native-compaction stack onto an official Pi release, then run checks,
 the build, the full test suite, and a CLI version smoke test. The source branch
@@ -32,6 +33,11 @@ while (( $# > 0 )); do
       VERSION="$2"
       shift 2
       ;;
+    --stack-revision)
+      [[ $# -ge 2 ]] || { echo "Missing value for --stack-revision" >&2; exit 2; }
+      STACK_REVISION="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -46,6 +52,10 @@ done
 
 if [[ -z $VERSION ]]; then
   VERSION=$(npm view "$PACKAGE" version)
+fi
+if [[ -n $STACK_REVISION && ! $STACK_REVISION =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Invalid stack revision: $STACK_REVISION" >&2
+  exit 2
 fi
 TAG="v$VERSION"
 
@@ -67,9 +77,16 @@ git -C "$repo" fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 git -C "$repo" fetch fork "refs/heads/$STACK_BRANCH:refs/remotes/fork/$STACK_BRANCH"
 
 stack_ref="refs/remotes/fork/$STACK_BRANCH"
+fetched_revision=$(git -C "$repo" rev-parse "$stack_ref")
+if [[ -n $STACK_REVISION && $fetched_revision != "$STACK_REVISION" ]]; then
+  echo "Stack branch moved: expected $STACK_REVISION, fetched $fetched_revision" >&2
+  exit 1
+fi
+STACK_REVISION=${STACK_REVISION:-$fetched_revision}
+
 git -C "$repo" rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null
-git -C "$repo" merge-base --is-ancestor "$STACK_BASE" "$stack_ref"
-mapfile -t commits < <(git -C "$repo" rev-list --reverse "$STACK_BASE..$stack_ref")
+git -C "$repo" merge-base --is-ancestor "$STACK_BASE" "$STACK_REVISION"
+mapfile -t commits < <(git -C "$repo" rev-list --reverse "$STACK_BASE..$STACK_REVISION")
 if [[ ${#commits[@]} -eq 0 ]]; then
   echo "No stack commits found after $STACK_BASE" >&2
   exit 1
@@ -93,5 +110,4 @@ git -C "$staging" cherry-pick "${commits[@]}"
   node packages/coding-agent/dist/cli.js --version | grep -Fx "$VERSION"
 )
 
-stack_revision=$(git -C "$repo" rev-parse "$stack_ref")
-echo "Validated Pi $VERSION with stack ${stack_revision:0:8}"
+echo "Validated Pi $VERSION with stack ${STACK_REVISION:0:8}"
