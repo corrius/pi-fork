@@ -366,7 +366,7 @@ export class Agent {
 	}
 
 	/** Continue from the current transcript or provider-owned state. */
-	async continue(): Promise<void> {
+	async continue(options: { deferFollowUps?: boolean } = {}): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -379,10 +379,12 @@ export class Agent {
 				return;
 			}
 
-			const queuedFollowUps = this.followUpQueue.drain();
-			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
-				return;
+			if (!options.deferFollowUps) {
+				const queuedFollowUps = this.followUpQueue.drain();
+				if (queuedFollowUps.length > 0) {
+					await this.runPromptMessages(queuedFollowUps);
+					return;
+				}
 			}
 		}
 
