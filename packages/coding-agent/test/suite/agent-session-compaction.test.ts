@@ -5,6 +5,7 @@ import {
 	type Model,
 } from "@earendil-works/pi-ai";
 import {
+	type Context,
 	getApiProvider,
 	type ProviderState,
 	registerApiProvider,
@@ -12,7 +13,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -408,6 +409,108 @@ describe("AgentSession compaction characterization", () => {
 			expect(harness.session.agent.state.providerState).toEqual(state);
 		},
 	);
+
+	it("retries native overflow before delivering queued follow-ups", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "overflow-retry");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		let releaseCompaction = () => {};
+		const compactionReleased = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		let notifyCompactionStarted = () => {};
+		const compactionStarted = new Promise<void>((resolve) => {
+			notifyCompactionStarted = resolve;
+		});
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => {
+					notifyCompactionStarted();
+					await compactionReleased;
+					return { state };
+				},
+			},
+			"native-compaction-test",
+		);
+		const postCompactionRequests: Context[] = [];
+		harness.setResponses([
+			createAssistant(harness, {
+				stopReason: "error",
+				errorMessage: "maximum context length exceeded",
+				timestamp: Date.now(),
+			}),
+			(context) => {
+				postCompactionRequests.push(context);
+				return fauxAssistantMessage("retried answer");
+			},
+			(context) => {
+				postCompactionRequests.push(context);
+				return fauxAssistantMessage("follow-up answer");
+			},
+		]);
+
+		const promptPromise = harness.session.prompt("overflowing prompt");
+		await compactionStarted;
+		await harness.session.steer("retry steering");
+		await harness.session.followUp("later follow-up");
+		releaseCompaction();
+		await promptPromise;
+
+		expect(postCompactionRequests).toHaveLength(2);
+		expect(postCompactionRequests[0]?.providerState).toEqual(state);
+		expect(postCompactionRequests[0]?.messages.map(getMessageText)).toEqual(["retry steering"]);
+		expect(postCompactionRequests[1]?.messages.map(getMessageText)).toEqual([
+			"retry steering",
+			"retried answer",
+			"later follow-up",
+		]);
+	});
+
+	it("starts queued follow-ups after native threshold compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "threshold-follow-up");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => ({ state }),
+			},
+			"native-compaction-test",
+		);
+		let request: Context | undefined;
+		harness.setResponses([
+			(context) => {
+				request = context;
+				return fauxAssistantMessage("follow-up answer");
+			},
+		]);
+		await harness.session.followUp("threshold follow-up");
+
+		const shouldContinue = await (harness.session as unknown as SessionWithCompactionInternals)._runAutoCompaction(
+			"threshold",
+			false,
+		);
+		expect(shouldContinue).toBe(true);
+		await harness.session.agent.continue();
+
+		expect(request?.providerState).toEqual(state);
+		expect(request?.messages.map(getMessageText)).toEqual(["threshold follow-up"]);
+	});
 
 	it("rejects incompatible state without persisting a checkpoint", async () => {
 		const harness = await createHarness();

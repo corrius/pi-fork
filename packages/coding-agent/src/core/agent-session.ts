@@ -320,6 +320,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _deferFollowUpsForOverflowRetry = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1081,9 +1082,12 @@ export class AgentSession {
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+				const deferFollowUps = this._deferFollowUpsForOverflowRetry;
+				this._deferFollowUpsForOverflowRetry = false;
+				await this.agent.continue({ deferFollowUps });
 			}
 		} finally {
+			this._deferFollowUpsForOverflowRetry = false;
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
@@ -2237,6 +2241,7 @@ export class AgentSession {
 					excludedEntryIds,
 				);
 				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				this._deferFollowUpsForOverflowRetry = willRetry;
 				return willRetry || this.agent.hasQueuedMessages();
 			}
 
