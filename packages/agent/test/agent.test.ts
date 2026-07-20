@@ -548,6 +548,63 @@ describe("Agent", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("continue() should continue from provider state without transcript messages", async () => {
+		const providerState = {
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+			model: "gpt-5.6-sol",
+			baseUrl: "https://chatgpt.com/backend-api",
+			data: [{ type: "compaction", encrypted_content: "opaque" }],
+		};
+		const agent = new Agent({
+			initialState: { providerState },
+			streamFn: (_model, context) => {
+				expect(context.providerState).toEqual(providerState);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Continued") });
+				});
+				return stream;
+			},
+		});
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		expect(agent.state.messages).toEqual([expect.objectContaining({ role: "assistant" })]);
+	});
+
+	it("continue() should process queued steering after provider compaction", async () => {
+		const providerState = {
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+			model: "gpt-5.6-sol",
+			baseUrl: "https://chatgpt.com/backend-api",
+			data: [{ type: "compaction", encrypted_content: "opaque" }],
+		};
+		const agent = new Agent({
+			initialState: { providerState },
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		agent.steer({
+			role: "user",
+			content: [{ type: "text", text: "Queued during compaction" }],
+			timestamp: Date.now(),
+		});
+
+		await expect(agent.continue()).resolves.toBeUndefined();
+
+		expect(agent.state.messages).toEqual([
+			expect.objectContaining({ role: "user" }),
+			expect.objectContaining({ role: "assistant" }),
+		]);
+	});
+
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
 		const agent = new Agent({
 			streamFn: () => {
