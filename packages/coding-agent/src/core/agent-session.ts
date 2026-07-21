@@ -2384,6 +2384,13 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
+	/** Context usage at which auto-compaction triggers for the current model. */
+	get autoCompactionThreshold(): number | undefined {
+		const contextWindow = this.model?.contextWindow;
+		if (contextWindow === undefined) return undefined;
+		return contextWindow - this.settingsManager.getCompactionSettings().reserveTokens;
+	}
+
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;

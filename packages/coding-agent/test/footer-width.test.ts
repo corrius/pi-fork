@@ -21,9 +21,12 @@ function createSession(options: {
 	reasoning?: boolean;
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
+	contextTokens?: number;
+	compactionReserveTokens?: number;
 	compactionTypes?: Array<"compaction" | "provider_checkpoint">;
 }): AgentSession {
 	const usage = options.usage;
+	const contextTokens = options.contextTokens ?? 24_600;
 	const entries = [
 		...(usage === undefined
 			? []
@@ -55,7 +58,14 @@ function createSession(options: {
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
-		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
+		getContextUsage: () => ({
+			tokens: contextTokens,
+			contextWindow: 200_000,
+			percent: (contextTokens / 200_000) * 100,
+		}),
+		get autoCompactionThreshold() {
+			return 200_000 - (options.compactionReserveTokens ?? 0);
+		},
 		modelRuntime: {
 			isUsingOAuth: () => false,
 		},
@@ -155,5 +165,19 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("↻2");
+	});
+
+	it("shows context usage relative to the auto-compaction threshold", () => {
+		const session = createSession({
+			sessionName: "",
+			contextTokens: 80_000,
+			compactionReserveTokens: 40_000,
+		});
+		const footer = new FooterComponent(session, createFooterData(1));
+
+		expect(stripAnsi(footer.render(120)[1])).toContain("50.0%/160k (auto)");
+
+		footer.setAutoCompactEnabled(false);
+		expect(stripAnsi(footer.render(120)[1])).toContain("40.0%/200k");
 	});
 });
