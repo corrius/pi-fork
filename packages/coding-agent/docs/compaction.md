@@ -1,12 +1,12 @@
 # Compaction & Branch Summarization
 
-LLMs have limited context windows. When conversations grow too long, pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
+LLMs have limited context windows. When conversations grow too long, pi compacts older content while preserving recent work. By default it generates a text summary; supported providers can instead persist a native checkpoint. This page covers compaction and branch summarization.
 
 **Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
 - [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
-- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `ProviderCheckpointEntry`, `BranchSummaryEntry`)
 - [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
 
 For TypeScript definitions in your project, inspect `node_modules/@earendil-works/pi-coding-agent/dist/`.
@@ -75,6 +75,14 @@ What the LLM sees:
        ↑         ↑      └─────────────────┬────────────────┘
     prompt   from cmp          messages from firstKeptEntryId
 ```
+
+### Native Provider Compaction
+
+Models configured with `"compaction": "native"` use a provider-owned compaction operation for the same manual, threshold, and overflow triggers. The first implementation supports ChatGPT OAuth models using `openai-codex-responses` and calls `/backend-api/codex/responses/compact`.
+
+The returned output is stored unchanged in a `ProviderCheckpointEntry`. While the provider, API, model, and base URL remain compatible, the request context consists of that opaque output followed by messages appended after the checkpoint. Earlier entries stay in the append-only session tree but are not sent. Switching to an incompatible model ignores the checkpoint and reconstructs context from the original entries.
+
+Native and summary compaction are mutually exclusive for an event. Native endpoint errors are surfaced without summary fallback, and native mode does not accept custom `/compact` instructions. See [Models](models.md#native-openai-codex-compaction) for configuration.
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
 
@@ -276,7 +284,7 @@ Fired before auto-compaction or `/compact`. Can cancel or provide custom summary
 
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
-  const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
+  const { preparation, branchEntries, customInstructions, reason, willRetry, mode, signal } = event;
 
   // preparation.messagesToSummarize - messages to summarize
   // preparation.turnPrefixMessages - split turn prefix (if isSplitTurn)
@@ -289,12 +297,13 @@ pi.on("session_before_compact", async (event, ctx) => {
   // branchEntries - all entries on current branch (for custom state)
   // reason - "manual" (/compact), "threshold", or "overflow"
   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+  // mode - "summary" or "native"
   // signal - AbortSignal (pass to LLM calls)
 
   // Cancel:
   return { cancel: true };
 
-  // Custom summary:
+  // Custom summary (only when mode === "summary"):
   return {
     compaction: {
       summary: "Your summary...",
@@ -340,7 +349,11 @@ pi.on("session_before_compact", async (event, ctx) => {
 });
 ```
 
-See [custom-compaction.ts](../examples/extensions/custom-compaction.ts) for a complete example using a different model.
+See [custom-compaction.ts](../examples/extensions/custom-compaction.ts) for a complete example using a different model. Returning a custom summary in native mode is an error; cancellation and observation work in both modes.
+
+### session_compact
+
+Fired after the session entry has been saved. `compactionEntry` is a `CompactionEntry` for summary mode or a `ProviderCheckpointEntry` for native mode.
 
 ### session_before_tree
 

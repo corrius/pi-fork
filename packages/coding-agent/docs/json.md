@@ -15,12 +15,12 @@ type AgentSessionEvent =
   | AgentEvent
   | { type: "queue_update"; steering: readonly string[]; followUp: readonly string[] }
   | { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
-  | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result: CompactionResult | undefined; aborted: boolean; willRetry: boolean; errorMessage?: string }
+  | { type: "compaction_end"; reason: "manual" | "threshold" | "overflow"; result: SessionCompactionResult | undefined; aborted: boolean; willRetry: boolean; errorMessage?: string }
   | { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
   | { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 ```
 
-`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction.
+`queue_update` emits the full pending steering and follow-up queues whenever they change. `compaction_start` and `compaction_end` cover both manual and automatic compaction. `SessionCompactionResult` is a text-summary `CompactionResult` or a native `ProviderCompactionResult` with `type: "provider_checkpoint"` and opaque provider state.
 
 Base events from [`AgentEvent`](https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/types.ts#L179):
 

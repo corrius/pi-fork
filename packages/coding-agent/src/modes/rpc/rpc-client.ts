@@ -9,7 +9,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
-import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { SessionCompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
@@ -297,7 +297,7 @@ export class RpcClient {
 	/**
 	 * Compact session context.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<SessionCompactionResult> {
 		const response = await this.send({ type: "compact", customInstructions });
 		return this.getData(response);
 	}

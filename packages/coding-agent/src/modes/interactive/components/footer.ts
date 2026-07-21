@@ -110,8 +110,12 @@ export class FooterComponent implements Component {
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
-		const contextPercentValue = contextUsage?.percent ?? 0;
-		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+		const contextLimit = this.autoCompactEnabled
+			? (this.session.autoCompactionThreshold ?? contextWindow)
+			: contextWindow;
+		const contextPercentValue =
+			contextUsage?.tokens === null ? 0 : ((contextUsage?.tokens ?? 0) / contextLimit) * 100;
+		const contextPercent = contextUsage?.tokens !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
 		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
@@ -128,6 +132,10 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} • ${sessionName}`;
 		}
 
+		const compactionCount = this.session.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "compaction" || entry.type === "provider_checkpoint").length;
+
 		// Build stats line
 		const statsParts = [];
 		if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
@@ -137,8 +145,9 @@ export class FooterComponent implements Component {
 		if ((totalCacheRead > 0 || totalCacheWrite > 0) && latestCacheHitRate !== undefined) {
 			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
 		}
+		if (compactionCount > 0) statsParts.push(`↻${compactionCount}`);
 		// Show cost with "(sub)" indicator if using OAuth subscription
-		const usingSubscription = state.model ? this.session.modelRegistry.isUsingOAuth(state.model) : false;
+		const usingSubscription = state.model ? this.session.modelRuntime.isUsingOAuth(state.model.provider) : false;
 		if (totalCost || usingSubscription) {
 			const costStr = `$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`;
 			statsParts.push(costStr);
@@ -149,8 +158,8 @@ export class FooterComponent implements Component {
 		const autoIndicator = this.autoCompactEnabled ? " (auto)" : "";
 		const contextPercentDisplay =
 			contextPercent === "?"
-				? `?/${formatTokens(contextWindow)}${autoIndicator}`
-				: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
+				? `?/${formatTokens(contextLimit)}${autoIndicator}`
+				: `${contextPercent}%/${formatTokens(contextLimit)}${autoIndicator}`;
 		if (contextPercentValue > 90) {
 			contextPercentStr = theme.fg("error", contextPercentDisplay);
 		} else if (contextPercentValue > 70) {

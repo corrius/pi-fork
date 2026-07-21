@@ -1,4 +1,4 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ProviderState } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "./session-manager.ts";
 
 /**
@@ -29,9 +29,9 @@ export interface CacheWasteTotals {
 	missCount: number;
 }
 
-/** Minimal pricing lookup, satisfied by ModelRegistry. Cost is $/million tokens. */
+/** Minimal pricing lookup, satisfied by ModelRuntime. Cost is $/million tokens. */
 export interface ModelPriceSource {
-	find(provider: string, modelId: string): { cost: { cacheRead: number } } | undefined;
+	getModel(provider: string, modelId: string): { cost: { cacheRead: number } } | undefined;
 }
 
 /** The last request seen by the scan; everything in its prompt should be cached. */
@@ -79,7 +79,7 @@ function detectMiss(
 	const readPerToken =
 		usage.cacheRead > 0
 			? usage.cost.cacheRead / usage.cacheRead
-			: (models.find(message.provider, message.model)?.cost.cacheRead ?? 0) / 1_000_000;
+			: (models.getModel(message.provider, message.model)?.cost.cacheRead ?? 0) / 1_000_000;
 
 	return {
 		missedTokens,
@@ -106,6 +106,7 @@ function scan(
 	models: ModelPriceSource,
 ): { prev: PreviousRequest | undefined; totals: CacheWasteTotals; misses: Map<AssistantMessage, CacheMiss> } {
 	let prev: PreviousRequest | undefined;
+	let pendingCheckpoint: ProviderState | undefined;
 	const totals: CacheWasteTotals = { missedTokens: 0, missedCost: 0, missCount: 0 };
 	const misses = new Map<AssistantMessage, CacheMiss>();
 
@@ -115,9 +116,23 @@ function scan(
 			// not re-billed content. Model switches are NOT exempt: they re-bill the
 			// full prompt and should be counted.
 			prev = undefined;
+			pendingCheckpoint = undefined;
+			continue;
+		}
+		if (entry.type === "provider_checkpoint") {
+			pendingCheckpoint = entry.state;
 			continue;
 		}
 		if (entry.type === "message" && entry.message.role === "assistant") {
+			if (
+				pendingCheckpoint &&
+				entry.message.provider === pendingCheckpoint.provider &&
+				entry.message.api === pendingCheckpoint.api &&
+				entry.message.model === pendingCheckpoint.model
+			) {
+				prev = undefined;
+			}
+			pendingCheckpoint = undefined;
 			const miss = detectMiss(prev, entry.message, models);
 			if (miss) {
 				totals.missedTokens += miss.missedTokens;

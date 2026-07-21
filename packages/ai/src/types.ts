@@ -189,6 +189,20 @@ export interface StreamOptions {
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
+export type ContextCompactionOptions = SimpleStreamOptions & Record<string, unknown>;
+
+export interface ProviderState<T = unknown> {
+	provider: ProviderId;
+	api: Api;
+	model: string;
+	baseUrl: string;
+	data: T;
+}
+
+export interface ContextCompactionResult<T = unknown> {
+	state: ProviderState<T>;
+	usage?: Usage;
+}
 
 /**
  * Maps known APIs to their full provider-specific stream option types.
@@ -217,9 +231,9 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 	: StreamOptions & Record<string, unknown>;
 
 /**
- * The uniform stream contract of an API implementation module: every module
- * under `src/api/` exports exactly `stream` and `streamSimple`, so the module
- * itself satisfies this interface. Lazy wrappers (`lazyApi()`) and provider
+ * The uniform stream contract of an API implementation module. Modules export
+ * `stream` and `streamSimple`; providers with one-shot context compaction may
+ * also export `compactContext`. Lazy wrappers (`lazyApi()`) and provider
  * factories pass these around as values. This is the untyped dispatch shape;
  * per-API option typing lives on the implementation modules themselves and on
  * `Provider.stream()` via `ApiStreamOptions`.
@@ -227,6 +241,11 @@ export type ApiStreamOptions<TApi extends Api> = TApi extends keyof ApiOptionsMa
 export interface ProviderStreams {
 	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
 	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+	compactContext?(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 /**
@@ -451,6 +470,7 @@ export interface Context {
 	systemPrompt?: string;
 	messages: Message[];
 	tools?: Tool[];
+	providerState?: ProviderState;
 }
 
 /**
@@ -524,6 +544,8 @@ export interface OpenAICompletionsCompat {
 	cacheControlFormat?: "anthropic";
 	/** Whether to send session-affinity data from `options.sessionId`. Default: false. */
 	sendSessionAffinityHeaders?: boolean;
+	/** Provider-specific deferred tool serialization mode. */
+	deferredToolsMode?: "kimi";
 	/** Session-affinity header format: `openai` sends `session_id`, `x-client-request-id`, and `x-session-affinity`; `openai-nosession` sends `x-client-request-id` and `x-session-affinity`; `openrouter` sends `x-session-id`. Does not affect the `prompt_cache_key` body param, which is governed by cache retention. Default: auto-detected. */
 	sessionAffinityFormat?: SessionAffinityFormat;
 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
@@ -717,6 +739,7 @@ export interface Model<TApi extends Api> {
 	cost: ModelCost;
 	contextWindow: number;
 	maxTokens: number;
+	compaction?: "summary" | "native";
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"

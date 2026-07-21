@@ -57,9 +57,9 @@ export function agentLoop(
  * Continue an agent loop from the current context without adding a new message.
  * Used for retries - context already has user message or tool results.
  *
- * **Important:** The last message in context must convert to a `user` or `toolResult` message
- * via `convertToLlm`. If it doesn't, the LLM provider will reject the request.
- * This cannot be validated here since `convertToLlm` is only called once per turn.
+ * **Important:** Without provider-owned state, the last message in context must convert to a
+ * `user` or `toolResult` message via `convertToLlm`. If it doesn't, the LLM provider will reject
+ * the request. This cannot be validated here since `convertToLlm` is only called once per turn.
  */
 export function agentLoopContinue(
 	context: AgentContext,
@@ -67,11 +67,11 @@ export function agentLoopContinue(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	if (context.messages.length === 0) {
+	if (context.messages.length === 0 && !context.providerState) {
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant") {
+	if (context.messages[context.messages.length - 1]?.role === "assistant") {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -124,11 +124,11 @@ export async function runAgentLoopContinue(
 	signal?: AbortSignal,
 	streamFn?: StreamFn,
 ): Promise<AgentMessage[]> {
-	if (context.messages.length === 0) {
+	if (context.messages.length === 0 && !context.providerState) {
 		throw new Error("Cannot continue: no messages in context");
 	}
 
-	if (context.messages[context.messages.length - 1].role === "assistant") {
+	if (context.messages[context.messages.length - 1]?.role === "assistant") {
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
@@ -274,6 +274,21 @@ async function runLoop(
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
+export async function createLlmContext(
+	context: AgentContext,
+	config: Pick<AgentLoopConfig, "transformContext" | "convertToLlm">,
+	signal?: AbortSignal,
+): Promise<Context> {
+	let messages = context.messages;
+	if (config.transformContext) messages = await config.transformContext(messages, signal);
+	return {
+		systemPrompt: context.systemPrompt,
+		messages: await config.convertToLlm(messages),
+		tools: context.tools,
+		providerState: context.providerState,
+	};
+}
+
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
@@ -285,21 +300,7 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFn?: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
-	}
-
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
+	const llmContext = await createLlmContext(context, config, signal);
 
 	const streamFunction = streamFn || streamSimple;
 

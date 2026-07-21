@@ -23,17 +23,7 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
-// Auth and model registry
-export {
-	type ApiKeyCredential,
-	type AuthCredential,
-	type AuthStatus,
-	AuthStorage,
-	type AuthStorageBackend,
-	FileAuthStorageBackend,
-	InMemoryAuthStorageBackend,
-	type OAuthCredential,
-} from "./core/auth-storage.ts";
+export { readStoredCredential } from "./core/auth-storage.ts";
 // Compaction
 export {
 	type BranchPreparation,
@@ -53,7 +43,9 @@ export {
 	generateBranchSummary,
 	generateSummary,
 	getLastAssistantUsage,
+	type ProviderCompactionResult,
 	prepareBranchEntries,
+	type SessionCompactionResult,
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.ts";
@@ -178,6 +170,11 @@ export {
 	resolveModelScopeWithDiagnostics,
 	type ScopedModel,
 } from "./core/model-resolver.ts";
+export {
+	type CreateModelRuntimeOptions,
+	ModelRuntime,
+	type ModelRuntimeAuthOverrides,
+} from "./core/model-runtime.ts";
 export type {
 	PackageManager,
 	PathMetadata,
@@ -230,6 +227,7 @@ export {
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
+	type ProviderCheckpointEntry,
 	parseSessionEntries,
 	type SessionContext,
 	type SessionEntry,

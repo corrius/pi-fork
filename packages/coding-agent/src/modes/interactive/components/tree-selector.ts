@@ -590,6 +590,9 @@ class TreeList implements Component {
 			case "compaction":
 				parts.push("compaction");
 				break;
+			case "provider_checkpoint":
+				parts.push("native compaction", entry.state.provider, entry.state.model);
+				break;
 			case "branch_summary":
 				parts.push("branch summary", entry.summary);
 				break;
@@ -822,6 +825,14 @@ class TreeList implements Component {
 			case "compaction": {
 				const tokens = Math.round(entry.tokensBefore / 1000);
 				result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+				break;
+			}
+			case "provider_checkpoint": {
+				const tokens = Math.round(entry.tokensBefore / 1000);
+				result = theme.fg(
+					"borderAccent",
+					`[native compaction: ${entry.state.provider}/${entry.state.model}, ${tokens}k tokens]`,
+				);
 				break;
 			}
 			case "branch_summary":

@@ -24,10 +24,20 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	AuthResult,
+	ContextCompactionResult,
+	ImageContent,
+	Message,
+	Model,
+	ProviderHeaders,
+	TextContent,
+} from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
+	compactContext,
 	getSupportedThinkingLevels,
 	isContextOverflow,
 	isRetryableAssistantError,
@@ -42,14 +52,19 @@ import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	type ProviderCompactionResult,
 	prepareCompaction,
+	prepareNativeCompaction,
+	type SessionCompactionResult,
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -83,11 +98,19 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
-import type { ModelRegistry } from "./model-registry.ts";
+import { ModelRegistry } from "./model-registry.ts";
+import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionBoundary,
+	getProviderStateTarget,
+	isProviderStateCompatible,
+	type SessionHeader,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -144,7 +167,7 @@ export type AgentSessionEvent =
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
-			result: CompactionResult | undefined;
+			result: SessionCompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
@@ -159,6 +182,12 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // Types
 // ============================================================================
 
+function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
+	return headers
+		? Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== null))
+		: undefined;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -170,8 +199,8 @@ export interface AgentSessionConfig {
 	resourceLoader: ResourceLoader;
 	/** SDK custom tools registered outside extensions */
 	customTools?: ToolDefinition[];
-	/** Model registry for API key resolution and model discovery */
-	modelRegistry: ModelRegistry;
+	/** Canonical model/auth runtime used by coding-agent internals. */
+	modelRuntime: ModelRuntime;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
@@ -291,6 +320,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _deferFollowUpsForOverflowRetry = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -325,8 +355,7 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 
-	// Model registry for API key resolution
-	private _modelRegistry: ModelRegistry;
+	private _modelRuntime: ModelRuntime;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -347,7 +376,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
-		this._modelRegistry = config.modelRegistry;
+		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
@@ -367,9 +396,8 @@ export class AgentSession {
 		});
 	}
 
-	/** Model registry for API key resolution and model discovery */
-	get modelRegistry(): ModelRegistry {
-		return this._modelRegistry;
+	get modelRuntime(): ModelRuntime {
+		return this._modelRuntime;
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -377,18 +405,25 @@ export class AgentSession {
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
 	}> {
-		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
-		if (!result.ok) {
-			if (result.error.startsWith("No API key found")) {
+		let result: AuthResult | undefined;
+		try {
+			result = await this._modelRuntime.getAuth(model);
+		} catch (error) {
+			const cause = error instanceof Error ? error.cause : undefined;
+			if (cause instanceof Error && cause.message === "authHeader requires a resolved API key") {
 				throw new Error(formatNoApiKeyFoundMessage(model.provider));
 			}
-			throw new Error(result.error);
+			throw error;
 		}
-		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers, env: result.env };
+		if (result?.auth.apiKey) {
+			return {
+				apiKey: result.auth.apiKey,
+				headers: withoutDeletedHeaders(result.auth.headers),
+				env: result.env,
+			};
 		}
 
-		const isOAuth = this._modelRegistry.isUsingOAuth(model);
+		const isOAuth = this._modelRuntime.isUsingOAuth(model.provider);
 		if (isOAuth) {
 			throw new Error(
 				`Authentication failed for "${model.provider}". ` +
@@ -408,8 +443,14 @@ export class AgentSession {
 			return this._getRequiredRequestAuth(model);
 		}
 
-		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
-		return result.ok ? { apiKey: result.apiKey, headers: result.headers, env: result.env } : {};
+		try {
+			const result = await this._modelRuntime.getAuth(model);
+			return result
+				? { apiKey: result.auth.apiKey, headers: withoutDeletedHeaders(result.auth.headers), env: result.env }
+				: {};
+		} catch {
+			return {};
+		}
 	}
 
 	/**
@@ -478,12 +519,20 @@ export class AgentSession {
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-			const previousContext = previousSnapshot?.context ?? turn.context;
+			const currentModel = this.agent.state.model;
+			const modelChanged =
+				currentModel !== undefined &&
+				(currentModel.provider !== turn.message.provider ||
+					currentModel.api !== turn.message.api ||
+					currentModel.id !== turn.message.model);
+			const nextContext = modelChanged
+				? await this.agent.createLlmContext(signal)
+				: (previousSnapshot?.context ?? turn.context);
 
 			return {
 				...previousSnapshot,
 				context: {
-					...previousContext,
+					...nextContext,
 					systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
 					tools: this.agent.state.tools.slice(),
 				},
@@ -543,6 +592,7 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
+	private _contextRestoreRevision = 0;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -567,6 +617,8 @@ export class AgentSession {
 				}
 			}
 		}
+
+		const contextRestoreRevisionBeforeExtension = this._contextRestoreRevision;
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
@@ -614,6 +666,11 @@ export class AgentSession {
 					});
 					this._retryAttempt = 0;
 				}
+			}
+
+			const selectedModel = this.model;
+			if (selectedModel && this._contextRestoreRevision !== contextRestoreRevisionBeforeExtension) {
+				this._restoreContextForModel(selectedModel);
 			}
 		}
 	};
@@ -1025,9 +1082,12 @@ export class AgentSession {
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+				const deferFollowUps = this._deferFollowUpsForOverflowRetry;
+				this._deferFollowUpsForOverflowRetry = false;
+				await this.agent.continue({ deferFollowUps });
 			}
 		} finally {
+			this._deferFollowUpsForOverflowRetry = false;
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
@@ -1141,8 +1201,11 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+			const hasConfiguredAuth =
+				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
+				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+			if (!hasConfiguredAuth) {
+				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
 					throw new Error(
 						`Authentication failed for "${this.model.provider}". ` +
@@ -1529,13 +1592,20 @@ export class AgentSession {
 		});
 	}
 
+	private _restoreContextForModel(model: Model<any>): void {
+		this._contextRestoreRevision++;
+		const context = this.sessionManager.buildSessionContext(getProviderStateTarget(model));
+		this.agent.state.messages = context.messages;
+		this.agent.state.providerState = context.providerState;
+	}
+
 	/**
 	 * Set model directly.
 	 * Validates that auth is configured, saves to session and settings.
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>): Promise<void> {
-		if (!this._modelRegistry.hasConfiguredAuth(model)) {
+		if (!(await this._modelRuntime.checkAuth(model.provider))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
@@ -1543,6 +1613,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
+		this._restoreContextForModel(model);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1565,7 +1636,13 @@ export class AgentSession {
 	}
 
 	private async _cycleScopedModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const scopedModels = this._scopedModels.filter((scoped) => this._modelRegistry.hasConfiguredAuth(scoped.model));
+		const checks = await Promise.all(
+			this._scopedModels.map(async (scoped) => ({
+				scoped,
+				auth: await this._modelRuntime.checkAuth(scoped.model.provider),
+			})),
+		);
+		const scopedModels = checks.filter(({ auth }) => auth !== undefined).map(({ scoped }) => scoped);
 		if (scopedModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -1580,6 +1657,7 @@ export class AgentSession {
 		// Apply model
 		this.agent.state.model = next.model;
 		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		this._restoreContextForModel(next.model);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		// Apply thinking level.
@@ -1594,7 +1672,7 @@ export class AgentSession {
 	}
 
 	private async _cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
-		const availableModels = await this._modelRegistry.getAvailable();
+		const availableModels = await this._modelRuntime.getAvailable();
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -1608,6 +1686,7 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		this._restoreContextForModel(nextModel);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
@@ -1728,12 +1807,96 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _prepareCompaction(
+		pathEntries: SessionEntry[],
+		settings: CompactionSettings,
+		native: boolean,
+	): CompactionPreparation | undefined {
+		return native
+			? prepareNativeCompaction(pathEntries, settings, this.agent.state.messages, this.agent.state.providerState)
+			: prepareCompaction(pathEntries, settings);
+	}
+
+	private async _compactProviderContext(
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
+		signal: AbortSignal,
+		excludedEntryIds?: string[],
+	): Promise<ProviderCompactionResult> {
+		const model = this.model;
+		if (!model) throw new Error(formatNoModelSelectedMessage());
+		const auth = await this._getRequiredRequestAuth(model);
+		let headers = mergeProviderAttributionHeaders(model, this.settingsManager, this.sessionId, auth.headers);
+		if (this._extensionRunner.hasHandlers("before_provider_headers")) {
+			headers = await this._extensionRunner.emitBeforeProviderHeaders(headers ?? {});
+		}
+
+		const providerContext = await this.agent.createLlmContext(signal);
+		const estimatedTokensBefore =
+			estimateMessagesTokens(this.agent.state.messages) +
+			(providerContext.providerState ? Math.ceil(JSON.stringify(providerContext.providerState.data).length / 4) : 0);
+		const providerRetrySettings = this.settingsManager.getProviderRetrySettings();
+		const result: ContextCompactionResult = await compactContext(model, providerContext, {
+			apiKey: auth.apiKey,
+			env: auth.env,
+			headers,
+			signal,
+			sessionId: this.sessionId,
+			reasoning: this.thinkingLevel === "off" ? undefined : this.thinkingLevel,
+			timeoutMs: providerRetrySettings.timeoutMs,
+			maxRetries: providerRetrySettings.maxRetries,
+			maxRetryDelayMs: providerRetrySettings.maxRetryDelayMs,
+			onPayload: async (payload) => {
+				if (!this._extensionRunner.hasHandlers("before_provider_request")) return payload;
+				return this._extensionRunner.emitBeforeProviderRequest(payload);
+			},
+			onResponse: async (response) => {
+				if (!this._extensionRunner.hasHandlers("after_provider_response")) return;
+				await this._extensionRunner.emit({
+					type: "after_provider_response",
+					status: response.status,
+					headers: response.headers,
+				});
+			},
+		});
+		if (signal.aborted) throw new Error("Compaction cancelled");
+		const stateTarget = getProviderStateTarget(model);
+		if (!isProviderStateCompatible(result.state, stateTarget)) {
+			throw new Error("Provider returned context state for a different provider, API, model, or base URL");
+		}
+
+		const tokensBefore = result.usage
+			? result.usage.input + result.usage.cacheRead + result.usage.cacheWrite
+			: estimatedTokensBefore;
+		this.sessionManager.appendProviderCheckpoint(result.state, tokensBefore, result.usage, excludedEntryIds);
+		const sessionContext = this.sessionManager.buildSessionContext(stateTarget);
+		this.agent.state.messages = sessionContext.messages;
+		this.agent.state.providerState = sessionContext.providerState;
+		const checkpointEntry = this.sessionManager.getLeafEntry();
+		if (checkpointEntry?.type === "provider_checkpoint") {
+			await this._extensionRunner.emit({
+				type: "session_compact",
+				compactionEntry: checkpointEntry,
+				fromExtension: false,
+				reason,
+				willRetry,
+			});
+		}
+		return {
+			type: "provider_checkpoint",
+			state: result.state,
+			tokensBefore,
+			estimatedTokensAfter: Math.ceil(JSON.stringify(result.state.data).length / 4),
+			usage: result.usage,
+		};
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
-	 * @param customInstructions Optional instructions for the compaction summary
+	 * @param customInstructions Optional instructions for summary compaction. Native compaction does not support them.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<SessionCompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1743,21 +1906,21 @@ export class AgentSession {
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
-
-			const { apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			const native = this.model.compaction === "native";
+			const summaryAuth = native ? undefined : await this._getSummarizationRequestAuth(this.model);
+			if (native && customInstructions) {
+				throw new Error("Custom compaction instructions are not supported by native compaction");
+			}
 
 			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				// Check why we can't compact
-				const lastEntry = pathEntries[pathEntries.length - 1];
-				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
-				}
-				throw new Error("Nothing to compact (session too small)");
+			const lastEntry = pathEntries[pathEntries.length - 1];
+			const latestCompatibleBoundary = getLatestCompactionBoundary(pathEntries, getProviderStateTarget(this.model));
+			if (lastEntry?.type === "compaction" || latestCompatibleBoundary?.id === lastEntry?.id) {
+				throw new Error("Already compacted");
 			}
+			const settings = this.settingsManager.getCompactionSettings();
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) throw new Error("Nothing to compact (session too small)");
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -1770,19 +1933,33 @@ export class AgentSession {
 					customInstructions,
 					reason: "manual",
 					willRetry: false,
+					mode: native ? "native" : "summary",
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
-				if (result?.cancel) {
-					throw new Error("Compaction cancelled");
-				}
-
+				if (result?.cancel) throw new Error("Compaction cancelled");
 				if (result?.compaction) {
 					extensionCompaction = result.compaction;
 					fromExtension = true;
 				}
 			}
 
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const result = await this._compactProviderContext("manual", false, this._compactionAbortController.signal);
+				this._emit({
+					type: "compaction_end",
+					reason: "manual",
+					result,
+					aborted: false,
+					willRetry: false,
+				});
+				return result;
+			}
+
+			const { apiKey, headers, env } = summaryAuth!;
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -1819,8 +1996,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
@@ -1916,7 +2094,10 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionBoundary(
+			this.sessionManager.getBranch(),
+			getProviderStateTarget(this.model),
+		);
 		const assistantIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
 		if (assistantIsFromBeforeCompaction) {
@@ -1948,13 +2129,18 @@ export class AgentSession {
 			}
 
 			this._overflowRecoveryAttempted = true;
-			// Remove the error message from agent state (it IS saved to session for history,
+			// Remove the overflow response from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			const overflowEntry = this.sessionManager.getLeafEntry();
+			const excludedEntryIds =
+				overflowEntry?.type === "message" && overflowEntry.message === assistantMessage
+					? [overflowEntry.id]
+					: undefined;
+			return await this._runAutoCompaction("overflow", willRetry, excludedEntryIds);
 		}
 
 		// Case 2: Threshold - context is getting large
@@ -1991,7 +2177,11 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		excludedEntryIds?: string[],
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 
@@ -2000,32 +2190,14 @@ export class AgentSession {
 				return false;
 			}
 
-			let apiKey: string | undefined;
-			let headers: Record<string, string> | undefined;
-			let env: Record<string, string> | undefined;
-			if (this.agent.streamFn === streamSimple) {
-				const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
-				if (!authResult.ok || !authResult.apiKey) {
-					return false;
-				}
-				apiKey = authResult.apiKey;
-				headers = authResult.headers;
-				env = authResult.env;
-			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
-			}
-
 			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
+			const native = this.model.compaction === "native";
+			const preparation = this._prepareCompaction(pathEntries, settings, native);
+			if (!preparation) return false;
 
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
-
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
 
@@ -2037,6 +2209,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
+					mode: native ? "native" : "summary",
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
 
@@ -2055,6 +2228,43 @@ export class AgentSession {
 					extensionCompaction = extensionResult.compaction;
 					fromExtension = true;
 				}
+			}
+
+			if (native) {
+				if (extensionCompaction) {
+					throw new Error("Extension-provided summaries are not supported by native compaction");
+				}
+				const result = await this._compactProviderContext(
+					reason,
+					willRetry,
+					this._autoCompactionAbortController.signal,
+					excludedEntryIds,
+				);
+				this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+				this._deferFollowUpsForOverflowRetry = willRetry;
+				return willRetry || this.agent.hasQueuedMessages();
+			}
+
+			let apiKey: string | undefined;
+			let headers: Record<string, string> | undefined;
+			let env: Record<string, string> | undefined;
+			if (this.agent.streamFn === streamSimple) {
+				const authResult = await this._modelRuntime.getAuth(this.model);
+				if (!authResult?.auth.apiKey) {
+					this._emit({
+						type: "compaction_end",
+						reason,
+						result: undefined,
+						aborted: true,
+						willRetry: false,
+					});
+					return false;
+				}
+				apiKey = authResult.auth.apiKey;
+				headers = withoutDeletedHeaders(authResult.auth.headers);
+				env = authResult.env;
+			} else {
+				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
 			}
 
 			let summary: string;
@@ -2100,8 +2310,9 @@ export class AgentSession {
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
 			const newEntries = this.sessionManager.getEntries();
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
@@ -2171,6 +2382,13 @@ export class AgentSession {
 	/** Whether auto-compaction is enabled */
 	get autoCompactionEnabled(): boolean {
 		return this.settingsManager.getCompactionEnabled();
+	}
+
+	/** Context usage at which auto-compaction triggers for the current model. */
+	get autoCompactionThreshold(): number | undefined {
+		const contextWindow = this.model?.contextWindow;
+		if (contextWindow === undefined) return undefined;
+		return contextWindow - this.settingsManager.getCompactionSettings().reserveTokens;
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
@@ -2267,12 +2485,13 @@ export class AgentSession {
 			return;
 		}
 
-		const refreshedModel = this._modelRegistry.find(currentModel.provider, currentModel.id);
+		const refreshedModel = this._modelRuntime.getModel(currentModel.provider, currentModel.id);
 		if (!refreshedModel || refreshedModel === currentModel) {
 			return;
 		}
 
 		this.agent.state.model = refreshedModel;
+		this._restoreContextForModel(refreshedModel);
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -2343,7 +2562,7 @@ export class AgentSession {
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model) => {
-					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
+					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
 					await this.setModel(model);
 					return true;
 				},
@@ -2383,11 +2602,11 @@ export class AgentSession {
 			},
 			{
 				registerProvider: (name, config) => {
-					this._modelRegistry.registerProvider(name, config);
+					this._modelRuntime.registerProvider(name, config);
 					this._refreshCurrentModelFromRegistry();
 				},
 				unregisterProvider: (name) => {
-					this._modelRegistry.unregisterProvider(name);
+					this._modelRuntime.unregisterProvider(name);
 					this._refreshCurrentModelFromRegistry();
 				},
 			},
@@ -2523,7 +2742,7 @@ export class AgentSession {
 			extensionsResult.runtime,
 			this._cwd,
 			this.sessionManager,
-			this._modelRegistry,
+			new ModelRegistry(this._modelRuntime),
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
@@ -2964,8 +3183,9 @@ export class AgentSession {
 			}
 
 			// Update agent state
-			const sessionContext = this.sessionManager.buildSessionContext();
+			const sessionContext = this.sessionManager.buildSessionContext(getProviderStateTarget(this.model));
 			this.agent.state.messages = sessionContext.messages;
+			this.agent.state.providerState = sessionContext.providerState;
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({
@@ -3033,6 +3253,14 @@ export class AgentSession {
 		let totalCost = 0;
 
 		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type === "provider_checkpoint" && entry.usage) {
+				totalInput += entry.usage.input;
+				totalOutput += entry.usage.output;
+				totalCacheRead += entry.usage.cacheRead;
+				totalCacheWrite += entry.usage.cacheWrite;
+				totalCost += entry.usage.cost.total;
+				continue;
+			}
 			if (entry.type !== "message") continue;
 			totalMessages++;
 			const message = entry.message;
@@ -3086,7 +3314,7 @@ export class AgentSession {
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
 		const branchEntries = this.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const latestCompaction = getLatestCompactionBoundary(branchEntries, getProviderStateTarget(model));
 
 		if (latestCompaction) {
 			// Check if there's a valid assistant usage after the compaction boundary

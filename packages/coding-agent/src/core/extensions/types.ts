@@ -25,6 +25,7 @@ import type {
 	OAuthCredentials,
 	OAuthLoginCallbacks,
 	ProviderHeaders,
+	RefreshModelsContext,
 	SimpleStreamOptions,
 	TextContent,
 	ToolResultMessage,
@@ -43,7 +44,7 @@ import type {
 import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
-import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type { CompactionPreparation, CompactionResult, SessionCompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
@@ -54,6 +55,7 @@ import type {
 	BranchSummaryEntry,
 	CompactionEntry,
 	CustomEntry,
+	ProviderCheckpointEntry,
 	ReadonlySessionManager,
 	SessionEntry,
 	SessionManager,
@@ -290,7 +292,7 @@ export interface ContextUsage {
 
 export interface CompactOptions {
 	customInstructions?: string;
-	onComplete?: (result: CompactionResult) => void;
+	onComplete?: (result: SessionCompactionResult) => void;
 	onError?: (error: Error) => void;
 }
 
@@ -584,13 +586,14 @@ export interface SessionBeforeCompactEvent {
 	reason: "manual" | "threshold" | "overflow";
 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
 	willRetry: boolean;
+	mode: "summary" | "native";
 	signal: AbortSignal;
 }
 
 /** Fired after context compaction */
 export interface SessionCompactEvent {
 	type: "session_compact";
-	compactionEntry: CompactionEntry;
+	compactionEntry: CompactionEntry | ProviderCheckpointEntry;
 	fromExtension: boolean;
 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
 	reason: "manual" | "threshold" | "overflow";
@@ -1420,17 +1423,24 @@ export interface ProviderConfig {
 	authHeader?: boolean;
 	/** Models to register. If provided, replaces all existing models for this provider. */
 	models?: ProviderModelConfig[];
+	/**
+	 * Refresh this provider's model list. The returned list replaces extension-provided models.
+	 * Use context.store explicitly when the catalog should persist across sessions.
+	 */
+	refreshModels?(context: RefreshModelsContext): Promise<ProviderModelConfig[]>;
 	/** OAuth provider for /login support. The `id` is set automatically from the provider name. */
 	oauth?: {
 		/** Display name for the provider in login UI. */
 		name: string;
+		/** @deprecated Retained for source compatibility; canonical auth flows ignore it. */
+		usesCallbackServer?: boolean;
 		/** Run the login flow, return credentials to persist. */
 		login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
 		/** Refresh expired credentials, return updated credentials to persist. */
 		refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
 		/** Convert credentials to API key string for the provider. */
 		getApiKey(credentials: OAuthCredentials): string;
-		/** Optional: modify models for this provider (e.g., update baseUrl based on credentials). */
+		/** Legacy synchronous credential-dependent model projection. */
 		modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 	};
 }

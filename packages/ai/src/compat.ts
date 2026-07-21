@@ -39,6 +39,7 @@ import { openAICompletionsApi } from "./api/openai-completions.lazy.ts";
 import { openAIResponsesApi } from "./api/openai-responses.lazy.ts";
 import { piMessagesApi } from "./api/pi-messages.lazy.ts";
 import { getEnvApiKey } from "./env-api-keys.ts";
+import type { ModelsApiStreamOptions } from "./models.ts";
 import { builtinModels, getBuiltinModel, getBuiltinModels, getBuiltinProviders } from "./providers/all.ts";
 
 export type { BuiltinProvider } from "./providers/all.ts";
@@ -50,6 +51,8 @@ import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
+	ContextCompactionOptions,
+	ContextCompactionResult,
 	Model,
 	ProviderStreamOptions,
 	ProviderStreams,
@@ -83,12 +86,22 @@ export interface ApiProvider<TApi extends Api = Api, TOptions extends StreamOpti
 	api: TApi;
 	stream: StreamFunction<TApi, TOptions>;
 	streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
+	compactContext?(
+		model: Model<TApi>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 interface ApiProviderInternal {
 	api: Api;
 	stream: ApiStreamFunction;
 	streamSimple: ApiStreamSimpleFunction;
+	compactContext?(
+		model: Model<Api>,
+		context: Context,
+		options?: ContextCompactionOptions,
+	): Promise<ContextCompactionResult>;
 }
 
 type RegisteredApiProvider = {
@@ -122,6 +135,18 @@ function wrapStreamSimple<TApi extends Api>(
 	};
 }
 
+function wrapCompactContext<TApi extends Api>(
+	api: TApi,
+	compactContext: NonNullable<ApiProvider<TApi>["compactContext"]>,
+): NonNullable<ApiProviderInternal["compactContext"]> {
+	return (model, context, options) => {
+		if (model.api !== api) {
+			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
+		}
+		return compactContext(model as Model<TApi>, context, options);
+	};
+}
+
 export function registerApiProvider<TApi extends Api, TOptions extends StreamOptions>(
 	provider: ApiProvider<TApi, TOptions>,
 	sourceId?: string,
@@ -131,6 +156,9 @@ export function registerApiProvider<TApi extends Api, TOptions extends StreamOpt
 			api: provider.api,
 			stream: wrapStream(provider.api, provider.stream),
 			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
+			compactContext: provider.compactContext
+				? wrapCompactContext(provider.api, provider.compactContext)
+				: undefined,
 		},
 		sourceId,
 	});
@@ -197,7 +225,12 @@ const builtinApiProviderInstances = new Map<Api, ReturnType<typeof getApiProvide
 export function registerBuiltInApiProviders(): void {
 	for (const [api, streams] of BUILTIN_APIS) {
 		if (!getApiProvider(api)) {
-			registerApiProvider({ api, stream: streams.stream, streamSimple: streams.streamSimple });
+			registerApiProvider({
+				api,
+				stream: streams.stream,
+				streamSimple: streams.streamSimple,
+				compactContext: streams.compactContext,
+			});
 		}
 		builtinApiProviderInstances.set(api, getApiProvider(api));
 	}
@@ -228,9 +261,14 @@ function withEnvApiKey<TOptions extends StreamOptions>(
 	return { ...options, apiKey } as TOptions;
 }
 
-function shouldUseBuiltinModels(model: Model<Api>): boolean {
-	const builtin = compatModels.getModel(model.provider, model.id);
-	return builtin?.api === model.api && getApiProvider(model.api) === builtinApiProviderInstances.get(model.api);
+function hasResolvedCloudflareAuth(options: StreamOptions | undefined): boolean {
+	return hasExplicitApiKey(options?.apiKey) || typeof options?.headers?.["cf-aig-authorization"] === "string";
+}
+
+function getBuiltinProviderForModel(model: Model<Api>) {
+	if (getApiProvider(model.api) !== builtinApiProviderInstances.get(model.api)) return undefined;
+	const provider = compatModels.getProvider(model.provider);
+	return provider?.getModels().some((candidate) => candidate.api === model.api) ? provider : undefined;
 }
 
 function resolveApiProvider(api: Api) {
@@ -246,8 +284,12 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: ProviderStreamOptions,
 ): AssistantMessageEventStream {
-	if (shouldUseBuiltinModels(model)) {
-		return compatModels.stream(model, context, options as ApiStreamOptions<TApi> | undefined);
+	const builtinProvider = getBuiltinProviderForModel(model);
+	if (builtinProvider) {
+		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
+			return compatModels.stream(model, context, options as ModelsApiStreamOptions<TApi> | undefined);
+		}
+		return builtinProvider.stream(model, context, withEnvApiKey(model, options) as ApiStreamOptions<TApi>);
 	}
 	const provider = resolveApiProvider(model.api);
 	return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
@@ -267,8 +309,12 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	if (shouldUseBuiltinModels(model)) {
-		return compatModels.streamSimple(model, context, options);
+	const builtinProvider = getBuiltinProviderForModel(model);
+	if (builtinProvider) {
+		if (model.provider.startsWith("cloudflare-") && !hasResolvedCloudflareAuth(options)) {
+			return compatModels.streamSimple(model, context, options);
+		}
+		return builtinProvider.streamSimple(model, context, withEnvApiKey(model, options));
 	}
 	const provider = resolveApiProvider(model.api);
 	return provider.streamSimple(model, context, withEnvApiKey(model, options));
@@ -281,4 +327,16 @@ export async function completeSimple<TApi extends Api>(
 ): Promise<AssistantMessage> {
 	const s = streamSimple(model, context, options);
 	return s.result();
+}
+
+export async function compactContext<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: ContextCompactionOptions,
+): Promise<ContextCompactionResult> {
+	const provider = getBuiltinProviderForModel(model) ?? resolveApiProvider(model.api);
+	if (!provider.compactContext) {
+		throw new Error(`API provider ${model.api} does not support native context compaction`);
+	}
+	return provider.compactContext(model, context, withEnvApiKey(model, options));
 }

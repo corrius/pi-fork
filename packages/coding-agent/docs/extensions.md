@@ -454,16 +454,17 @@ Fired on compaction. See [compaction.md](compaction.md) for details.
 
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
-  const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;
+  const { preparation, branchEntries, customInstructions, reason, willRetry, mode, signal } = event;
 
   // reason - "manual" (/compact), "threshold", or "overflow"
   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+  // mode - "summary" or "native"
 
   // Cancel:
   return { cancel: true };
 
-  // Custom summary:
-  return {
+  // Custom summary (summary mode only):
+  if (mode === "summary") return {
     compaction: {
       summary: "...",
       firstKeptEntryId: preparation.firstKeptEntryId,
@@ -473,12 +474,14 @@ pi.on("session_before_compact", async (event, ctx) => {
 });
 
 pi.on("session_compact", async (event, ctx) => {
-  // event.compactionEntry - the saved compaction
+  // event.compactionEntry - CompactionEntry or ProviderCheckpointEntry
   // event.fromExtension - whether extension provided it
   // event.reason - "manual" (/compact), "threshold", or "overflow"
   // event.willRetry - whether the aborted turn is retried after compaction (overflow recovery)
 });
 ```
+
+Native mode supports cancellation and observation, but returning a custom summary is an error. Its saved `ProviderCheckpointEntry` contains opaque provider state rather than summary text.
 
 #### session_before_tree / session_tree
 
@@ -1677,7 +1680,7 @@ Register or override a model provider dynamically. Useful for proxies, custom en
 
 Calls made during the extension factory function are queued and applied once the runner initialises. Calls made after that — for example from a command handler following a user setup flow — take effect immediately without requiring a `/reload`.
 
-If you need to discover models from a remote endpoint, prefer an async extension factory over deferring the fetch to `session_start`. pi waits for the factory before startup continues, so the registered models are available immediately, including to `pi --list-models`.
+Dynamic providers can implement `refreshModels`. Pi calls it during model refresh, publishes the returned list synchronously through the provider, and passes the canonical credential/store/network/signal context. The extension decides whether to persist the catalog through `context.store`; live servers such as llama.cpp can ignore it.
 
 ```typescript
 // Register a new provider with custom models
@@ -1697,6 +1700,26 @@ pi.registerProvider("my-proxy", {
       maxTokens: 16384
     }
   ]
+});
+
+// Register a live llama.cpp catalog without persisting discovered models
+pi.registerProvider("llama.cpp", {
+  baseUrl: "http://localhost:8080/v1",
+  apiKey: "local",
+  api: "openai-completions",
+  async refreshModels({ signal }) {
+    const response = await fetch("http://localhost:8080/v1/models", { signal });
+    const { data } = await response.json();
+    return data.map(({ id }) => ({
+      id,
+      name: id,
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384
+    }));
+  }
 });
 
 // Override baseUrl for an existing provider (keeps all models)
@@ -1736,6 +1759,7 @@ pi.registerProvider("corporate-ai", {
 - `headers` - Custom headers to include in requests.
 - `authHeader` - If true, adds `Authorization: Bearer` header automatically.
 - `models` - Array of model definitions. If provided, replaces all existing models for this provider. Model definitions can set `baseUrl` to override the provider endpoint for that model.
+- `refreshModels` - Async dynamic discovery callback. Its returned models replace extension-provided models. Use the scoped `context.store` only when results should persist.
 - `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu.
 - `streamSimple` - Custom streaming implementation for non-standard APIs.
 

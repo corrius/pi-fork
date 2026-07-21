@@ -4,9 +4,16 @@ import {
 	fauxAssistantMessage,
 	type Model,
 } from "@earendil-works/pi-ai";
+import {
+	type Context,
+	getApiProvider,
+	type ProviderState,
+	registerApiProvider,
+	unregisterApiProviders,
+} from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokens } from "../../src/core/compaction/index.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
@@ -67,6 +74,16 @@ function useSummaryStreamFn(harness: Harness, summary: string): () => number {
 	return () => callCount;
 }
 
+function createProviderState(model: Model<string>, encryptedContent: string): ProviderState {
+	return {
+		provider: model.provider,
+		api: model.api,
+		model: model.id,
+		baseUrl: model.baseUrl,
+		data: [{ type: "compaction", encrypted_content: encryptedContent }],
+	};
+}
+
 function seedCompactableSession(harness: Harness): void {
 	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
 	const now = Date.now();
@@ -89,6 +106,7 @@ describe("AgentSession compaction characterization", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		unregisterApiProviders("native-compaction-test");
 		vi.useRealTimers();
 		vi.restoreAllMocks();
 		while (harnesses.length > 0) {
@@ -125,6 +143,424 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.estimatedTokensAfter).toBe(estimatedTokensAfter);
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("persists a native checkpoint instead of a summary", async () => {
+		let beforeMode: "summary" | "native" | undefined;
+		let compactEntryType: string | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => {
+						beforeMode = event.mode;
+					});
+					pi.on("session_compact", (event) => {
+						compactEntryType = event.compactionEntry.type;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "opaque");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		let compactCalls = 0;
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async (_model, context) => {
+					compactCalls++;
+					expect(context.messages).toHaveLength(compactCalls === 1 ? 2 : 1);
+					if (compactCalls > 1) {
+						expect(context.providerState).toEqual(state);
+						return { state };
+					}
+					return {
+						state,
+						usage: {
+							input: 10,
+							output: 2,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 12,
+							cost: { input: 0.01, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+						},
+					};
+				},
+			},
+			"native-compaction-test",
+		);
+
+		const result = await harness.session.compact();
+
+		expect("type" in result && result.type).toBe("provider_checkpoint");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
+			1,
+		);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+		expect(harness.session.agent.state.providerState).toEqual(state);
+		expect(harness.session.messages).toHaveLength(0);
+		expect(beforeMode).toBe("native");
+		expect(compactEntryType).toBe("provider_checkpoint");
+		expect(harness.session.getSessionStats().tokens).toMatchObject({ input: 110, output: 2 });
+		expect(harness.session.getSessionStats().cost).toBe(0.01);
+		await expect(harness.session.compact()).rejects.toThrow("Already compacted");
+
+		const nextMessage = { role: "user" as const, content: "new tail", timestamp: Date.now() };
+		harness.sessionManager.appendMessage(nextMessage);
+		harness.session.agent.state.messages = [nextMessage];
+		await harness.session.compact();
+		const checkpoints = harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint");
+		expect(checkpoints).toHaveLength(2);
+		expect(checkpoints[1].tokensBefore).toBeGreaterThan(estimateTokens(nextMessage));
+	});
+
+	it("allows native compaction after switching away from an incompatible checkpoint", async () => {
+		let harness: Harness;
+		let secondModel: Model<string>;
+		harness = await createHarness({
+			models: [
+				{ id: "model-a", contextWindow: 128_000, maxTokens: 16_384 },
+				{ id: "model-b", contextWindow: 128_000, maxTokens: 16_384 },
+			],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_compact", async (event) => {
+						if (
+							event.compactionEntry.type === "provider_checkpoint" &&
+							event.compactionEntry.state.model === "model-a"
+						) {
+							await harness.session.setModel(secondModel);
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const firstModel = harness.getModel("model-a")!;
+		secondModel = harness.getModel("model-b")!;
+		firstModel.compaction = "native";
+		secondModel.compaction = "native";
+		const provider = getApiProvider(firstModel.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: firstModel.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async (requestModel) => ({
+					state: {
+						provider: requestModel.provider,
+						api: requestModel.api,
+						model: requestModel.id,
+						baseUrl: requestModel.baseUrl,
+						data: [{ type: "compaction", encrypted_content: requestModel.id }],
+					},
+				}),
+			},
+			"native-compaction-test",
+		);
+
+		await harness.session.compact();
+		const restoredContext = await harness.session.agent.createLlmContext();
+		const firstModelContext = {
+			systemPrompt: restoredContext.systemPrompt ?? "",
+			messages: restoredContext.messages,
+			tools: harness.session.agent.state.tools,
+			providerState: createProviderState(firstModel, "model-a"),
+		};
+		const firstModelResponse = { ...createAssistant(harness, { stopReason: "stop" }), model: "model-a" };
+		expect(harness.session.model?.id).toBe("model-b");
+		expect(harness.session.agent.state.providerState).toBeUndefined();
+		expect(harness.session.messages).toHaveLength(2);
+
+		const nextTurn = await harness.session.agent.prepareNextTurnWithContext?.({
+			message: firstModelResponse,
+			toolResults: [],
+			context: firstModelContext,
+			newMessages: [],
+		});
+		expect(nextTurn?.context?.providerState).toBeUndefined();
+		expect(nextTurn?.context?.messages).toHaveLength(2);
+		await harness.session.compact();
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
+			2,
+		);
+		expect(harness.session.agent.state.providerState?.model).toBe("model-b");
+	});
+
+	it("lets extensions cancel native compaction before the provider request", async () => {
+		let providerCalls = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => {
+						expect(event.mode).toBe("native");
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => {
+					providerCalls++;
+					throw new Error("should not be called");
+				},
+			},
+			"native-compaction-test",
+		);
+
+		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
+		expect(providerCalls).toBe(0);
+	});
+
+	it("uses native compaction for threshold-triggered compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "threshold");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => ({ state }),
+			},
+			"native-compaction-test",
+		);
+
+		await (harness.session as unknown as SessionWithCompactionInternals)._runAutoCompaction("threshold", false);
+
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
+			1,
+		);
+		expect(harness.eventsOfType("compaction_end").at(-1)?.reason).toBe("threshold");
+	});
+
+	it.each(["error", "length"] as const)(
+		"uses native compaction for %s overflow recovery without checkpointing the failed response",
+		async (stopReason) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			seedCompactableSession(harness);
+			const model = harness.getModel();
+			model.compaction = "native";
+			const overflow = createAssistant(harness, {
+				stopReason,
+				errorMessage: stopReason === "error" ? "maximum context length exceeded" : undefined,
+				totalTokens: model.contextWindow + 1,
+				timestamp: Date.now(),
+			});
+			harness.sessionManager.appendMessage(overflow);
+			harness.session.agent.state.messages = [...harness.session.agent.state.messages, overflow];
+			const state = createProviderState(model, "overflow");
+			const provider = getApiProvider(model.api);
+			if (!provider) throw new Error("Missing faux provider");
+			registerApiProvider(
+				{
+					api: model.api,
+					stream: provider.stream,
+					streamSimple: provider.streamSimple,
+					compactContext: async (_model, compactedContext) => {
+						expect(compactedContext.messages).toHaveLength(2);
+						return { state };
+					},
+				},
+				"native-compaction-test",
+			);
+
+			const recovered = await (harness.session as unknown as SessionWithCompactionInternals)._checkCompaction(
+				overflow,
+			);
+
+			expect(recovered).toBe(true);
+			expect(harness.sessionManager.getEntries()).toContainEqual(
+				expect.objectContaining({ type: "message", message: overflow }),
+			);
+			const checkpoints = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "provider_checkpoint");
+			expect(checkpoints).toHaveLength(1);
+			expect(checkpoints[0]?.excludedEntryIds).toEqual([
+				harness.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message === overflow)
+					?.id,
+			]);
+			expect(harness.session.agent.state.providerState).toEqual(state);
+		},
+	);
+
+	it("retries native overflow before delivering queued follow-ups", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "overflow-retry");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		let releaseCompaction = () => {};
+		const compactionReleased = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		let notifyCompactionStarted = () => {};
+		const compactionStarted = new Promise<void>((resolve) => {
+			notifyCompactionStarted = resolve;
+		});
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => {
+					notifyCompactionStarted();
+					await compactionReleased;
+					return { state };
+				},
+			},
+			"native-compaction-test",
+		);
+		const postCompactionRequests: Context[] = [];
+		harness.setResponses([
+			createAssistant(harness, {
+				stopReason: "error",
+				errorMessage: "maximum context length exceeded",
+				timestamp: Date.now(),
+			}),
+			(context) => {
+				postCompactionRequests.push(context);
+				return fauxAssistantMessage("retried answer");
+			},
+			(context) => {
+				postCompactionRequests.push(context);
+				return fauxAssistantMessage("follow-up answer");
+			},
+		]);
+
+		const promptPromise = harness.session.prompt("overflowing prompt");
+		await compactionStarted;
+		await harness.session.steer("retry steering");
+		await harness.session.followUp("later follow-up");
+		releaseCompaction();
+		await promptPromise;
+
+		expect(postCompactionRequests).toHaveLength(2);
+		expect(postCompactionRequests[0]?.providerState).toEqual(state);
+		expect(postCompactionRequests[0]?.messages.map(getMessageText)).toEqual(["retry steering"]);
+		expect(postCompactionRequests[1]?.messages.map(getMessageText)).toEqual([
+			"retry steering",
+			"retried answer",
+			"later follow-up",
+		]);
+	});
+
+	it("starts queued follow-ups after native threshold compaction", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const state = createProviderState(model, "threshold-follow-up");
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => ({ state }),
+			},
+			"native-compaction-test",
+		);
+		let request: Context | undefined;
+		harness.setResponses([
+			(context) => {
+				request = context;
+				return fauxAssistantMessage("follow-up answer");
+			},
+		]);
+		await harness.session.followUp("threshold follow-up");
+
+		const shouldContinue = await (harness.session as unknown as SessionWithCompactionInternals)._runAutoCompaction(
+			"threshold",
+			false,
+		);
+		expect(shouldContinue).toBe(true);
+		await harness.session.agent.continue();
+
+		expect(request?.providerState).toEqual(state);
+		expect(request?.messages.map(getMessageText)).toEqual(["threshold follow-up"]);
+	});
+
+	it("rejects incompatible state without persisting a checkpoint", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => ({
+					state: { ...createProviderState(model, "opaque"), model: "different-model" },
+				}),
+			},
+			"native-compaction-test",
+		);
+
+		await expect(harness.session.compact()).rejects.toThrow("different provider, API, model, or base URL");
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "provider_checkpoint")).toBe(false);
+	});
+
+	it("does not fall back to summary compaction when native compaction fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const model = harness.getModel();
+		model.compaction = "native";
+		const provider = getApiProvider(model.api);
+		if (!provider) throw new Error("Missing faux provider");
+		registerApiProvider(
+			{
+				api: model.api,
+				stream: provider.stream,
+				streamSimple: provider.streamSimple,
+				compactContext: async () => {
+					throw new Error("native compact failed");
+				},
+			},
+			"native-compaction-test",
+		);
+
+		await expect(harness.session.compact()).rejects.toThrow("native compact failed");
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "provider_checkpoint")).toHaveLength(
+			0,
+		);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);
 	});
 
 	it("throws when compacting without a model", async () => {

@@ -56,4 +56,71 @@ describe("InteractiveMode compaction events", () => {
 		);
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
+
+	test("rebuilds the transcript without applying a provider checkpoint boundary", () => {
+		const entries = [{ type: "provider_checkpoint" }];
+		const fakeThis = {
+			chatContainer: { clear: vi.fn() },
+			sessionManager: { buildContextEntries: vi.fn(() => entries) },
+			renderSessionEntries: vi.fn(),
+		};
+		const rebuildChatFromMessages = Reflect.get(InteractiveMode.prototype, "rebuildChatFromMessages") as (
+			this: typeof fakeThis,
+		) => void;
+
+		rebuildChatFromMessages.call(fakeThis);
+
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledWith();
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(entries);
+	});
+
+	test("restores the full transcript without applying a provider checkpoint boundary", () => {
+		const entries = [{ type: "provider_checkpoint" }];
+		const fakeThis = {
+			sessionManager: {
+				buildContextEntries: vi.fn(() => entries),
+				getEntries: vi.fn(() => []),
+			},
+			renderSessionEntries: vi.fn(),
+			renderProjectTrustWarningIfNeeded: vi.fn(),
+			showStatus: vi.fn(),
+		};
+		const renderInitialMessages = Reflect.get(InteractiveMode.prototype, "renderInitialMessages") as (
+			this: typeof fakeThis,
+		) => void;
+
+		renderInitialMessages.call(fakeThis);
+
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledWith();
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith(entries, {
+			updateFooter: true,
+			populateHistory: true,
+		});
+	});
+
+	test("preserves steering behavior when flushing into an active agent run", async () => {
+		const fakeThis = {
+			compactionQueuedMessages: [{ text: "change direction", mode: "steer" as const }],
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockResolvedValue(undefined),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockResolvedValue(undefined),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await flushCompactionQueue.call(fakeThis, { willRetry: false });
+
+		expect(fakeThis.session.prompt).toHaveBeenCalledWith("change direction", { streamingBehavior: "steer" });
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		expect(fakeThis.showError).not.toHaveBeenCalled();
+	});
 });
