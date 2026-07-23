@@ -61,6 +61,7 @@ if [[ -n $STACK_REVISION && ! $STACK_REVISION =~ ^[0-9a-f]{40}$ ]]; then
 fi
 TAG="v$VERSION"
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work_root="${PI_NATIVE_WORK_ROOT:-/tmp}"
 mkdir -p "$work_root"
 work_dir=$(mktemp -d "$work_root/pi-native-validation.XXXXXX")
@@ -101,18 +102,26 @@ git -C "$repo" config user.email "corrius@gmail.com"
 git -C "$repo" worktree add --detach "$staging" "$TAG"
 git -C "$staging" cherry-pick "${commits[@]}"
 
+"$script_dir/hydrate-model-data.sh" "$staging"
+
 (
   cd "$staging"
   npm ci --ignore-scripts
   npm run check
   git diff --exit-code
 
-  tsgo=node_modules/@typescript/native-preview/bin/tsgo.js
-  for package in tui ai agent coding-agent orchestrator; do
-    node "$tsgo" -p "packages/$package/tsconfig.build.json"
-  done
+  if node -e 'const pkg = require("./package.json"); process.exit(pkg.scripts?.["build:offline"] ? 0 : 1)'; then
+    npm run build:offline
+  else
+    tsgo=node_modules/@typescript/native-preview/bin/tsgo.js
+    for package in tui ai agent coding-agent orchestrator; do
+      node "$tsgo" -p "packages/$package/tsconfig.build.json"
+    done
+  fi
   chmod +x packages/coding-agent/dist/cli.js packages/coding-agent/dist/rpc-entry.js
-  chmod +x packages/orchestrator/dist/cli.js
+  if [[ -f packages/orchestrator/dist/cli.js ]]; then
+    chmod +x packages/orchestrator/dist/cli.js
+  fi
   mkdir -p \
     packages/coding-agent/dist/modes/interactive/theme \
     packages/coding-agent/dist/modes/interactive/assets \
