@@ -33,7 +33,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - name: Resolve official version and stack revision
@@ -56,7 +56,10 @@ jobs:
             exit 1
           fi
           validator_revision=$(
-            sha256sum .github/workflows/pi-native-stack.yml scripts/pi-native/validate-stack.sh |
+            sha256sum \
+              .github/workflows/pi-native-stack.yml \
+              scripts/pi-native/hydrate-model-data.sh \
+              scripts/pi-native/validate-stack.sh |
               sha256sum |
               awk '{print $1}'
           )
