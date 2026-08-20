@@ -545,7 +545,9 @@ export async function compactContext(
 	const request = buildRequestBody(model, context, requestOptions, codexSessionId);
 	let body: RequestBody = {
 		model: request.model,
-		input: request.input,
+		store: false,
+		stream: true,
+		input: [...(request.input ?? []), { type: "compaction_trigger" }] as ResponseInput,
 		instructions: request.instructions,
 		tools: request.tools,
 		parallel_tool_calls: request.parallel_tool_calls,
@@ -553,15 +555,23 @@ export async function compactContext(
 		service_tier: request.service_tier,
 		prompt_cache_key: request.prompt_cache_key,
 		text: request.text,
+		include: request.include,
 	};
 	const nextBody = await options?.onPayload?.(body, model);
 	if (nextBody !== undefined) body = nextBody as RequestBody;
 
 	const headers = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
-	headers.set("accept", "application/json");
+	const betaFeatures = new Set(
+		(headers.get("x-codex-beta-features") ?? "")
+			.split(",")
+			.map((feature) => feature.trim())
+			.filter(Boolean),
+	);
+	betaFeatures.add("remote_compaction_v2");
+	headers.set("x-codex-beta-features", [...betaFeatures].join(","));
 	let compacted: CompactResponse;
 	try {
-		compacted = await postCodexCompactRequest(model, body, headers, options);
+		compacted = await postCodexCompactionRequest(model, body, headers, options);
 	} catch (error) {
 		if (options?.signal?.aborted) throw new DOMException("Request was aborted", "AbortError");
 		throw error;
@@ -582,7 +592,7 @@ export async function compactContext(
 	};
 }
 
-async function postCodexCompactRequest(
+async function postCodexCompactionRequest(
 	model: Model<"openai-codex-responses">,
 	body: RequestBody,
 	headers: Headers,
@@ -599,7 +609,7 @@ async function postCodexCompactRequest(
 		try {
 			let response: Response;
 			try {
-				response = await fetch(resolveCodexCompactUrl(model.baseUrl), {
+				response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
 					method: "POST",
 					headers,
 					body: JSON.stringify(body),
@@ -619,7 +629,7 @@ async function postCodexCompactRequest(
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			if (response.ok) {
 				try {
-					return (await response.json()) as CompactResponse;
+					return await parseCodexCompactionResponse(response, combinedSignal.signal);
 				} catch (error) {
 					if (options?.signal?.aborted) throw new Error("Request was aborted");
 					const responseError =
@@ -665,6 +675,37 @@ async function postCodexCompactRequest(
 	}
 
 	throw new Error("Codex compact request failed after retries");
+}
+
+async function parseCodexCompactionResponse(response: Response, signal?: AbortSignal): Promise<CompactResponse> {
+	const output: Array<Record<string, unknown>> = [];
+	let usage: CompactResponse["usage"];
+	let completionStatus: CodexResponseStatus | undefined;
+
+	for await (const event of mapCodexEvents(parseSSE(response, signal))) {
+		if (event.type === "response.output_item.done") {
+			const item = (event as unknown as { item?: Record<string, unknown> }).item;
+			if (item?.type === "compaction") output.push(item);
+		}
+		if (event.type === "response.completed") {
+			const completedResponse = (
+				event as unknown as {
+					response?: { status?: CodexResponseStatus; usage?: CompactResponse["usage"] };
+				}
+			).response;
+			usage = completedResponse?.usage;
+			completionStatus = completedResponse?.status;
+		}
+	}
+
+	if (completionStatus !== "completed") {
+		throw new Error(`Invalid Codex compact response: terminal status was ${completionStatus ?? "missing"}`);
+	}
+	if (output.length !== 1) {
+		throw new Error(`Invalid Codex compact response: expected one compaction output item, received ${output.length}`);
+	}
+
+	return { output: output as unknown as ResponseInput, usage };
 }
 
 // ============================================================================
@@ -798,10 +839,6 @@ function resolveCodexUrl(baseUrl?: string): string {
 	return `${normalized}/codex/responses`;
 }
 
-function resolveCodexCompactUrl(baseUrl?: string): string {
-	return `${resolveCodexUrl(baseUrl)}/compact`;
-}
-
 function getCompactedInput(model: Model<"openai-codex-responses">, context: Context): ResponseInput {
 	const state = context.providerState;
 	if (!state) return [];
@@ -916,7 +953,7 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 
 async function* mapCodexEvents(
 	events: AsyncIterable<Record<string, unknown>>,
-	output: AssistantMessage,
+	output?: AssistantMessage,
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
@@ -939,7 +976,7 @@ async function* mapCodexEvents(
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
 			const response = (event as { response?: { status?: unknown; end_turn?: unknown } }).response;
-			if (typeof response?.end_turn === "boolean") {
+			if (typeof response?.end_turn === "boolean" && output) {
 				output.endTurn = response.end_turn;
 			}
 			const normalizedResponse = response
